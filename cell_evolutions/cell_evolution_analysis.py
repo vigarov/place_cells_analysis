@@ -1,0 +1,627 @@
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.optimize import curve_fit
+from tqdm.auto import tqdm
+
+
+def select_active_cells(final_rm, threshold, max_cells=None):
+    """
+    Select cells whose peak activation exceeds a threshold.
+
+    Returns
+    -------
+    cell_indices : np.ndarray
+        Indices sorted by descending peak activation.
+    peak : np.ndarray
+        Peak activation for every cell in `final_rm`.
+    """
+    peak = np.nanmax(final_rm, axis=(1, 2))
+    cell_indices = np.where(peak > threshold)[0]
+
+    if len(cell_indices) == 0:
+        return cell_indices, peak
+
+    order = np.argsort(peak[cell_indices])[::-1]
+    cell_indices = cell_indices[order]
+
+    if max_cells is not None and len(cell_indices) > max_cells:
+        print(
+            f"{len(cell_indices)} cells pass filter; showing top {max_cells} by peak activation."
+        )
+        cell_indices = cell_indices[:max_cells]
+
+    return cell_indices, peak
+
+
+def _gaussian_2d(params, x, y):
+    amp, mu_x, mu_y, sigma_x, sigma_y = params
+    return amp * np.exp(
+        -0.5 * ((x - mu_x) / sigma_x) ** 2 - 0.5 * ((y - mu_y) / sigma_y) ** 2
+    )
+
+
+def _make_sum_gaussians_model(n_gaussians):
+    def model(xy, *flat_params):
+        x, y = xy
+        total = np.zeros_like(x, dtype=np.float64)
+        for k in range(n_gaussians):
+            total += _gaussian_2d(flat_params[k * 5 : (k + 1) * 5], x, y)
+        return total
+
+    return model
+
+
+def _init_sum_gaussian_params(field, mask, xx, yy, n_gaussians):
+    h, w = field.shape
+    residual = np.zeros(field.shape, dtype=np.float64)
+    residual[mask] = np.maximum(field[mask].astype(np.float64), 0.0)
+    x_pts = xx[mask]
+    y_pts = yy[mask]
+    params = []
+
+    for _ in range(n_gaussians):
+        v = residual[mask]
+        if v.sum() <= 0:
+            params.extend([0.1, w / 2, h / 2, max(w / 4, 1.0), max(h / 4, 1.0)])
+            continue
+
+        wsum = v.sum()
+        mu_x = (x_pts * v).sum() / wsum
+        mu_y = (y_pts * v).sum() / wsum
+        var_x = ((x_pts - mu_x) ** 2 * v).sum() / wsum
+        var_y = ((y_pts - mu_y) ** 2 * v).sum() / wsum
+        sigma_x = np.sqrt(max(var_x, 1.0))
+        sigma_y = np.sqrt(max(var_y, 1.0))
+        amp = v.max()
+        comp = _gaussian_2d([amp, mu_x, mu_y, sigma_x, sigma_y], xx, yy)
+        residual = np.maximum(residual - comp, 0.0)
+        params.extend([amp, mu_x, mu_y, sigma_x, sigma_y])
+
+    return params
+
+
+def _resolve_torch_device(device):
+    if device == "cpu":
+        return torch.device("cpu")
+    if device == "gpu":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        raise RuntimeError("device='gpu' requested but no CUDA or MPS backend is available")
+    raise ValueError("device must be 'cpu' or 'gpu'")
+
+
+class SumGaussians2D(nn.Module):
+    """Sum of independent 2D Gaussians, trainable with gradient descent."""
+
+    def __init__(self, n_gaussians, h, w, init_params):
+        super().__init__()
+        self.n_gaussians = n_gaussians
+        self.h = h
+        self.w = w
+        p = torch.tensor(init_params, dtype=torch.float32).view(n_gaussians, 5)
+        self._raw_amp = nn.Parameter(self._inv_softplus(p[:, 0].clamp(min=1e-6)))
+        self._raw_mu_x = nn.Parameter(self._logit(p[:, 1].clamp(min=0.0, max=w - 1) / max(w - 1, 1.0)))
+        self._raw_mu_y = nn.Parameter(self._logit(p[:, 2].clamp(min=0.0, max=h - 1) / max(h - 1, 1.0)))
+        self._raw_sigma_x = nn.Parameter(self._inv_softplus(p[:, 3].clamp(min=0.5)))
+        self._raw_sigma_y = nn.Parameter(self._inv_softplus(p[:, 4].clamp(min=0.5)))
+
+    @staticmethod
+    def _inv_softplus(y):
+        return y + torch.log(-torch.expm1(-y.clamp(min=1e-6)))
+
+    @staticmethod
+    def _logit(p):
+        p = p.clamp(1e-6, 1.0 - 1e-6)
+        return torch.log(p / (1.0 - p))
+
+    def _constrained_params(self):
+        amp = F.softplus(self._raw_amp)
+        mu_x = torch.sigmoid(self._raw_mu_x) * max(self.w - 1, 1.0)
+        mu_y = torch.sigmoid(self._raw_mu_y) * max(self.h - 1, 1.0)
+        sigma_x = F.softplus(self._raw_sigma_x).clamp(min=0.5, max=float(self.w))
+        sigma_y = F.softplus(self._raw_sigma_y).clamp(min=0.5, max=float(self.h))
+        return amp, mu_x, mu_y, sigma_x, sigma_y
+
+    def forward(self, x, y):
+        amp, mu_x, mu_y, sigma_x, sigma_y = self._constrained_params()
+        total = torch.zeros_like(x, dtype=torch.float32)
+        for k in range(self.n_gaussians):
+            total = total + amp[k] * torch.exp(
+                -0.5 * ((x - mu_x[k]) / sigma_x[k]) ** 2
+                - 0.5 * ((y - mu_y[k]) / sigma_y[k]) ** 2
+            )
+        return total
+
+    def component_fields(self, xx, yy):
+        amp, mu_x, mu_y, sigma_x, sigma_y = self._constrained_params()
+        components = []
+        component_params = []
+        for k in range(self.n_gaussians):
+            comp = (
+                amp[k]
+                * torch.exp(
+                    -0.5 * ((xx - mu_x[k]) / sigma_x[k]) ** 2
+                    - 0.5 * ((yy - mu_y[k]) / sigma_y[k]) ** 2
+                )
+            ).detach()
+            components.append(comp)
+            component_params.append(
+                {
+                    "amplitude": float(amp[k].detach().cpu()),
+                    "mu_x": float(mu_x[k].detach().cpu()),
+                    "mu_y": float(mu_y[k].detach().cpu()),
+                    "sigma_x": float(sigma_x[k].detach().cpu()),
+                    "sigma_y": float(sigma_y[k].detach().cpu()),
+                }
+            )
+        return components, component_params
+
+
+def _aic_from_least_squares(n_obs: int, ss_res: float, n_params: int) -> float:
+    """
+    Akaike Information Criterion for least-squares fits.
+    `AIC = n * ln(RSS / n) + 2 * k` with `k` free parameters and
+    `RSS` the sum of squared residuals.
+    """
+    if n_obs <= n_params or ss_res <= 0 or not np.isfinite(ss_res):
+        return np.nan
+    return float(n_obs * np.log(ss_res / n_obs) + 2 * n_params)
+
+
+def _fit_sum_gaussians_scipy(field, n_gaussians, maxfev=20_000):
+    """Fit a sum of independent 2D Gaussians with scipy."""
+    mask = np.isfinite(field)
+    if not np.any(mask):
+        return None
+
+    h, w = field.shape
+    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    x_pts = xx[mask]
+    y_pts = yy[mask]
+    y_true = field[mask].astype(np.float64)
+    if np.all(y_true <= 0):
+        return None
+
+    p0 = _init_sum_gaussian_params(field, mask, xx, yy, n_gaussians)
+    lower, upper = [], []
+    for _ in range(n_gaussians):
+        lower.extend([0.0, 0.0, 0.0, 0.5, 0.5])
+        upper.extend([np.inf, w - 1, h - 1, w, h])
+
+    model = _make_sum_gaussians_model(n_gaussians)
+    try:
+        popt, _ = curve_fit(
+            model,
+            (x_pts, y_pts),
+            y_true,
+            p0=p0,
+            bounds=(lower, upper),
+            maxfev=maxfev,
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+    y_pred = model((x_pts, y_pts), *popt)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    n_obs = int(y_true.size)
+    n_params = 5 * n_gaussians
+    aic = _aic_from_least_squares(n_obs, float(ss_res), n_params)
+
+    components = []
+    component_params = []
+    for k in range(n_gaussians):
+        p = popt[k * 5 : (k + 1) * 5]
+        comp = _gaussian_2d(p, xx, yy)
+        components.append(comp)
+        component_params.append(
+            {
+                "amplitude": p[0],
+                "mu_x": p[1],
+                "mu_y": p[2],
+                "sigma_x": p[3],
+                "sigma_y": p[4],
+            }
+        )
+
+    return {
+        "components": components,
+        "component_params": component_params,
+        "sum_field": np.sum(components, axis=0),
+        "r2": r2,
+        "aic": aic,
+    }
+
+
+def _fit_sum_gaussians_torch(
+    field,
+    n_gaussians,
+    torch_device,
+    n_steps=3_000,
+    lr=0.05,
+    *,
+    early_stop_patience=50,
+    early_stop_eps=1e-8,
+):
+    """Fit a sum of independent 2D Gaussians with PyTorch gradient descent."""
+    mask = np.isfinite(field)
+    if not np.any(mask):
+        return None
+
+    h, w = field.shape
+    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    x_pts = torch.tensor(xx[mask], dtype=torch.float32, device=torch_device)
+    y_pts = torch.tensor(yy[mask], dtype=torch.float32, device=torch_device)
+    y_true = torch.tensor(field[mask], dtype=torch.float32, device=torch_device)
+    if torch.all(y_true <= 0):
+        return None
+
+    p0 = _init_sum_gaussian_params(field, mask, xx, yy, n_gaussians)
+    model = SumGaussians2D(n_gaussians, h, w, p0).to(torch_device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    prev_loss = None
+    stagnant_steps = 0
+    for _ in range(n_steps):
+        optimizer.zero_grad(set_to_none=True)
+        y_pred = model(x_pts, y_pts)
+        loss = torch.mean((y_pred - y_true) ** 2)
+        loss.backward()
+        optimizer.step()
+
+        loss_val = loss.item()
+        if prev_loss is not None and abs(prev_loss - loss_val) <= early_stop_eps:
+            stagnant_steps += 1
+            if stagnant_steps >= early_stop_patience:
+                break
+        else:
+            stagnant_steps = 0
+        prev_loss = loss_val
+
+    with torch.no_grad():
+        y_pred = model(x_pts, y_pts)
+        ss_res = torch.sum((y_true - y_pred) ** 2).item()
+        ss_tot = torch.sum((y_true - y_true.mean()) ** 2).item()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    xx_t = torch.tensor(xx, dtype=torch.float32, device=torch_device)
+    yy_t = torch.tensor(yy, dtype=torch.float32, device=torch_device)
+    components_t, component_params = model.component_fields(xx_t, yy_t)
+    components = [comp.cpu().numpy() for comp in components_t]
+    sum_field = np.sum(components, axis=0)
+
+    return {
+        "components": components,
+        "component_params": component_params,
+        "sum_field": sum_field,
+        "r2": r2,
+    }
+
+
+def fit_sum_gaussians(
+    field,
+    n_gaussians=2,
+    device="cpu",
+    *,
+    maxfev=20_000,
+    n_steps=3_000,
+    lr=0.05,
+    early_stop_patience=30,
+    early_stop_eps=1e-8,
+):
+    """
+    Fit a sum of independent 2D Gaussians.
+
+    Parameters
+    ----------
+    device : {'cpu', 'gpu'}
+        `'cpu'` uses `scipy.optimize.curve_fit`; `'gpu'` trains
+        :class:`SumGaussians2D` with gradient descent on CUDA/MPS.
+    early_stop_patience, early_stop_eps
+        GPU only. Stop when train MSE changes by at most `early_stop_eps` for
+        `early_stop_patience` consecutive steps.
+    """
+    if device == "cpu":
+        return _fit_sum_gaussians_scipy(field, n_gaussians, maxfev=maxfev)
+    if device == "gpu":
+        return _fit_sum_gaussians_torch(
+            field,
+            n_gaussians,
+            _resolve_torch_device(device),
+            n_steps=n_steps,
+            lr=lr,
+            early_stop_patience=early_stop_patience,
+            early_stop_eps=early_stop_eps,
+        )
+    raise ValueError("device must be 'cpu' or 'gpu'")
+
+
+def fit_gaussian_sums(
+    final_rm,
+    cell_indices,
+    n_gaussians=2,
+    verbose=True,
+    *,
+    show_progress=True,
+    device="cpu",
+    maxfev=20_000,
+    n_steps=3_000,
+    lr=0.05,
+    early_stop_patience=30,
+    early_stop_eps=1e-8,
+):
+    """Fit Gaussian sums for each selected cell."""
+    gaussian_fits = []
+    cells = cell_indices
+    if show_progress:
+        cells = tqdm(cells, desc=f"Gaussian fits (N={n_gaussians}, {device})")
+    for cell_idx in cells:
+        fit = fit_sum_gaussians(
+            final_rm[cell_idx],
+            n_gaussians=n_gaussians,
+            device=device,
+            maxfev=maxfev,
+            n_steps=n_steps,
+            lr=lr,
+            early_stop_patience=early_stop_patience,
+            early_stop_eps=early_stop_eps,
+        )
+        if fit is None:
+            if verbose:
+                msg = f"cell {cell_idx}: could not fit Gaussian sum"
+                if show_progress:
+                    tqdm.write(msg)
+                else:
+                    print(msg)
+            continue
+        fit["cell_idx"] = cell_idx
+        gaussian_fits.append(fit)
+    return gaussian_fits
+
+
+def mean_r2_by_n_and_maxfev(
+    final_rm,
+    cell_indices,
+    n_gaussians_values=(1, 2, 3),
+    maxfev_values=None,
+    *,
+    show_progress=True,
+):
+    """
+    Fit Gaussian sums on a grid of ``n_gaussians`` and ``maxfev`` values.
+
+    Uses ``scipy.optimize.curve_fit`` (CPU) with the given ``maxfev`` limit.
+
+    Returns
+    -------
+    dict
+        ``n_values``, ``maxfev_values``, ``mean_r2`` and ``wall_time_s``
+        (each shape ``n × maxfev``), ``total_wall_time_s``, and
+        ``gaussian_fits_by_n_maxfev`` mapping ``(n, maxfev)`` to fit lists.
+    """
+    if maxfev_values is None:
+        maxfev_values = np.sort(np.r_[np.logspace(2, 4, 5), 2 * np.logspace(2, 4, 5)])
+    n_values = np.asarray(n_gaussians_values, dtype=int)
+    maxfev_values = np.asarray(maxfev_values, dtype=int)
+    mean_r2 = np.full((len(n_values), len(maxfev_values)), np.nan)
+    wall_time_s = np.full((len(n_values), len(maxfev_values)), np.nan)
+    gaussian_fits_by_n_maxfev = {}
+
+    t_start_total = time.perf_counter()
+    n_iter = tqdm(n_values, desc="R² grid vs N and maxfev") if show_progress else n_values
+    for i, n in enumerate(n_iter):
+        fev_iter = (
+            tqdm(maxfev_values, desc=f"maxfev (N={n})", leave=False)
+            if show_progress
+            else maxfev_values
+        )
+        for j, maxfev in enumerate(fev_iter):
+            t0 = time.perf_counter()
+            fits = fit_gaussian_sums(
+                final_rm,
+                cell_indices,
+                n_gaussians=int(n),
+                verbose=False,
+                show_progress=False,
+                device="cpu",
+                maxfev=int(maxfev),
+            )
+            elapsed = time.perf_counter() - t0
+            wall_time_s[i, j] = elapsed
+            gaussian_fits_by_n_maxfev[(int(n), int(maxfev))] = fits
+            if fits:
+                mean_r2[i, j] = np.mean([fit["r2"] for fit in fits])
+            if show_progress and hasattr(fev_iter, "set_postfix"):
+                fev_iter.set_postfix(time=f"{elapsed:.1f}s")
+
+    total_wall_time_s = time.perf_counter() - t_start_total
+    msg = f"Gaussian grid total wall time: {total_wall_time_s:.1f} s"
+    if show_progress:
+        tqdm.write(msg)
+    else:
+        print(msg)
+
+    return {
+        "n_values": n_values,
+        "maxfev_values": maxfev_values,
+        "mean_r2": mean_r2,
+        "wall_time_s": wall_time_s,
+        "total_wall_time_s": total_wall_time_s,
+        "gaussian_fits_by_n_maxfev": gaussian_fits_by_n_maxfev,
+    }
+
+
+def mean_r2_by_n_gaussians(
+    final_rm,
+    cell_indices,
+    n_gaussians_range=6,
+    device="cpu",
+    *,
+    n_steps=3_000,
+    lr=0.05,
+    early_stop_patience=30,
+    early_stop_eps=1e-8,
+):
+    """
+    Fit Gaussian sums for each `n` in `range(n_gaussians_range)` and return
+    the mean R² across selected cells.
+
+    Parameters
+    ----------
+    device : {'cpu', 'gpu'}
+        `'cpu'` fits with scipy; `'gpu'` fits with PyTorch gradient descent.
+    early_stop_patience, early_stop_eps
+        GPU only. Stop when train MSE changes by at most `early_stop_eps` for
+        `early_stop_patience` consecutive steps.
+
+    Returns
+    -------
+    dict
+        `n_values` and `mean_r2` arrays, one entry per `n`;
+        `gaussian_fits_by_n` maps each `n` to the list of per-cell fit dicts
+        from `fit_gaussian_sums`; `wall_time_by_n_s` maps each `n` to elapsed
+        seconds for that sweep; `wall_time_s` is the total elapsed seconds;
+        `device` is the fitting backend used.
+    """
+    n_values = np.arange(n_gaussians_range)
+    mean_r2 = np.full(n_gaussians_range, np.nan)
+    gaussian_fits_by_n = {}
+    wall_time_by_n_s = {}
+    t0 = time.perf_counter()
+
+    for n in tqdm(n_values, desc=f"Mean R² vs N Gaussians ({device})"):
+        if n == 0:
+            continue
+        t_n = time.perf_counter()
+        fits = fit_gaussian_sums(
+            final_rm,
+            cell_indices,
+            n_gaussians=n,
+            verbose=False,
+            show_progress=False,
+            device=device,
+            n_steps=n_steps,
+            lr=lr,
+            early_stop_patience=early_stop_patience,
+            early_stop_eps=early_stop_eps,
+            maxfev = int(n*40)
+        )
+        end = time.perf_counter()
+        wall_time_by_n_s[int(n)] = end - t_n
+        gaussian_fits_by_n[int(n)] = fits
+        if fits:
+            mean_r2[n] = np.mean([fit["r2"] for fit in fits])
+
+    return {
+        "n_values": n_values,
+        "mean_r2": mean_r2,
+        "gaussian_fits_by_n": gaussian_fits_by_n,
+        "wall_time_by_n_s": wall_time_by_n_s,
+        "wall_time_s": time.perf_counter() - t0,
+        "device": device,
+    }
+
+
+def collect_r2_by_cell_and_n(r2_by_n):
+    """
+    Collect per-cell R² values across Gaussian counts.
+
+    Returns
+    -------
+    n_values : np.ndarray
+    r2_by_cell : dict[int, np.ndarray]
+        Maps each cell index to its R² values over `n_values`.
+    """
+    gaussian_fits_by_n = r2_by_n["gaussian_fits_by_n"]
+    n_values = np.array(sorted(n for n in gaussian_fits_by_n if n > 0))
+    cell_indices = sorted(
+        {
+            fit["cell_idx"]
+            for n in n_values
+            for fit in gaussian_fits_by_n[int(n)]
+        }
+    )
+    r2_by_cell = {}
+    for cell_idx in cell_indices:
+        r2_vals = []
+        for n in n_values:
+            fit = next(
+                (f for f in gaussian_fits_by_n[int(n)] if f["cell_idx"] == cell_idx),
+                None,
+            )
+            r2_vals.append(fit["r2"] if fit is not None else np.nan)
+        r2_by_cell[cell_idx] = np.array(r2_vals, dtype=np.float64)
+    return n_values, r2_by_cell
+
+
+def sem_r2_over_n_by_cell(r2_by_n):
+    """
+    Compute the SEM of R² across Gaussian counts for each cell.
+
+    Returns
+    -------
+    n_values : np.ndarray
+    r2_by_cell : dict[int, np.ndarray]
+    sem_by_cell : dict[int, float]
+    """
+    n_values, r2_by_cell = collect_r2_by_cell_and_n(r2_by_n)
+    sem_by_cell = {}
+    for cell_idx, r2_vals in r2_by_cell.items():
+        valid = r2_vals[np.isfinite(r2_vals)]
+        if len(valid) < 2:
+            sem_by_cell[cell_idx] = np.nan
+        else:
+            sem_by_cell[cell_idx] = np.std(valid, ddof=1) / np.sqrt(len(valid))
+    return n_values, r2_by_cell, sem_by_cell
+
+
+def select_cells_sensitive_to_n(r2_by_n, sem_threshold=0.2):
+    """
+    Select cells whose R² SEM across N exceeds a threshold.
+
+    Returns
+    -------
+    cell_indices : np.ndarray
+        Sensitive cells ordered by descending SEM.
+    sem_by_cell : dict[int, float]
+    r2_by_cell : dict[int, np.ndarray]
+    n_values : np.ndarray
+    """
+    n_values, r2_by_cell, sem_by_cell = sem_r2_over_n_by_cell(r2_by_n)
+    sensitive = [
+        cell_idx
+        for cell_idx, sem in sem_by_cell.items()
+        if np.isfinite(sem) and sem > sem_threshold
+    ]
+    order = np.argsort([sem_by_cell[cell_idx] for cell_idx in sensitive])[::-1]
+    cell_indices = np.array(sensitive, dtype=int)[order]
+    return cell_indices, sem_by_cell, r2_by_cell, n_values
+
+
+def print_gaussian_fit_summary(gaussian_fits, n_gaussians):
+    """Print fit quality and component parameters for each cell."""
+    has_aic = any("aic" in fit for fit in gaussian_fits)
+    print(f"Gaussian sum fits (N={n_gaussians}, final epoch):")
+    if has_aic:
+        print(f"{'cell':>6} {'R²':>8} {'AIC':>12}")
+    else:
+        print(f"{'cell':>6} {'R²':>8}")
+    for fit in gaussian_fits:
+        if has_aic:
+            aic = fit.get("aic", np.nan)
+            print(f"{fit['cell_idx']:6d} {fit['r2']:8.3f} {aic:12.1f}")
+        else:
+            print(f"{fit['cell_idx']:6d} {fit['r2']:8.3f}")
+        for k, p in enumerate(fit["component_params"], start=1):
+            print(
+                f"       g{k}: amp={p['amplitude']:.3f} "
+                f"μ=({p['mu_x']:.1f},{p['mu_y']:.1f}) "
+                f"σ=({p['sigma_x']:.1f},{p['sigma_y']:.1f})"
+            )

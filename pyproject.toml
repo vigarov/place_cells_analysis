@@ -1,3 +1,51 @@
+[project]
+name = "place-cells-episodic-rnn"
+version = "0.1.0"
+description = "Recurrent autoencoder model of hippocampal place cells (Wang et al., NeurIPS 2024)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "plotly>=6.8.0",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "torch>=2.9.1",
+    "tqdm>=4.67.3",
+]
+
+[project.scripts]
+generate-room = "trajectories.src.generate_room:main"
+generate-cycles-rooms = "scripts.generate_cycles_rooms:main"
+cycles-experiment = "cycles.cycles_experiment:main"
+truncate-cycles-results = "cycles.truncate_cycles_results:main"
+estimate-gaussians-rf = "cycles.estimate_gaussians_rf:main"
+
 [build-system]
 requires = ["setuptools >= 64"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nn4n*", "trajectories*", "cell_evolutions*", "cycles*", "scripts*"]
+
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]

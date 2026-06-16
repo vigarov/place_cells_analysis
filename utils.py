@@ -11,10 +11,16 @@ def visualize_response_map(response_map, random_cell=False, im_width=3, n_cols=5
     else:
         cell_indices = range(n_cells)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(im_width*n_cols, im_width*n_rows))
+    # Display colormap range using the global min and max across sampled cells
+    plotted_cells = [response_map[idx] for idx in cell_indices[:n_cols*n_rows]]
+    all_vals = np.concatenate([cell.flatten() for cell in plotted_cells])
+    vmin, vmax = 0, np.nanmax(all_vals)
+
+    im = None
     for i, ax in enumerate(axes.flat):
         if i < len(cell_indices):
             rm = response_map[cell_indices[i]]
-            ax.imshow(rm, cmap='jet')
+            im = ax.imshow(rm, cmap='jet', vmin=vmin, vmax=vmax)
             min_fr, max_fr, mean_fr = np.nanmin(rm), np.nanmax(rm), np.nanmean(rm)
             ax.set_title(f'min: {min_fr:.2f}, max: {max_fr:.2f}\nmean: {mean_fr:.2f}', fontsize=10)
             ax.set_xticks([])
@@ -22,8 +28,15 @@ def visualize_response_map(response_map, random_cell=False, im_width=3, n_cols=5
         else:
             ax.axis('off')
     plt.tight_layout()
-    plt.show()
+    if im is not None:
+        # Add a colorbar on the right side (vertical, middle position)
+        fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="Firing rate", orientation="vertical", location="right")
+        # fig.subplots_adjust(right=2.8)
 
+        
+    # plt.tight_layout()
+
+    plt.show()
 
 class RatemapAggregator:
     def __init__(self, arena_map, device=None):

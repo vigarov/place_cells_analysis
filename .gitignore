@@ -1,6 +1,11 @@
 # Custom
 .DS_Store
-trajectories/
+trajectories/100*
+trajectories/200*
+trajectories/cycles/
+ckpts/
+plots/
+results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
