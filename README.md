@@ -32,23 +32,40 @@ conda create -n place-rae python=3.10
 conda activate place-rae
 ```
 
-#### Install `nn4n`
+#### Install the package
 ```bash
 cd <project_root>
 pip install -e .
+# or: uv pip install -e .
 ```
 
-### Trajectories
-The trajectories were originally generated using a privately maintained simulation code base. We’ll release a minimal reproducible version of that simulation later. For now, the trajectory generation step is replaced with pre-generated trajectories stored in the `trajectories` folder, which can be found at [Trajectories Google Drive](https://drive.google.com/drive/folders/1Dk9dzgiGq4DXhHyLSZN_vx8Ct8sudUxU?usp=drive_link).
+### Data
+Pre-generated trajectories live under `data/`. Download from [Trajectories Google Drive](https://drive.google.com/drive/folders/1Dk9dzgiGq4DXhHyLSZN_vx8Ct8sudUxU?usp=drive_link) and place them in `data/<room_name>/`.
 
-### Data Structure
+Generate new rooms with:
+```bash
+uv run generate-room --shape square --width 100
+uv run generate-cycles-rooms
+```
+
+### Project layout
 ```bash
 <project_root>/
-├── trajectories/
+├── src/
+│   ├── analysis/          # Gaussian RF fitting, cell evolution
+│   ├── cycles/            # Multi-room cycles experiment
+│   ├── core/              # Shared utils (WSM cells, rate maps)
+│   ├── models/nn4n/       # Vendored NN4Neurosim RNN (import as nn4n)
+│   ├── trajectories/      # Room & trajectory generation
+│   └── scripts/           # CLI helpers
+├── data/
 │   ├── <room_name>/
 │   │   ├── traj_<speed>_<boundary_avoidance>.npz
 │   │   └── arena_map.npz
-│   └── ...
+│   └── cycles/            # 20-room cycles dataset
+├── ckpts/
+├── plots/
+└── results/
 ```
 
 We've attached 2 different rooms, a 200x200 pixel^2 (1 pixel = 1 cm) room and a 100x100 pixel^2 room. The `arena_map.npz` file contains the arena map with 1 being the occupied space and 0 being the unoccupied space. 
@@ -90,10 +107,14 @@ The parameters `random_drift_magnitude`, `switch_direction_prob`, `switch_veloci
 Each trajectory file contains a tensor of shape `(B, Ts, 2)` with `B = 128` and `Ts = 2048s`, discretized at `50` ms bins (`2048 / 50 * 1000ms/s = 40960` steps). The last dimension stores the `(x, y)` coordinates of the trajectory, with each `.npz` file containing trajectories long enough to cover the entire arena.
 
 ## Training
-All training code is in `demo.ipynb`. A pre-trained checkpoint (`latest.pth`) is provided in the `ckpts` folder.
+- Single-room training and method comparison: `src/analysis/notebook/training_methods.ipynb`
+- Cell evolution / Gaussian analysis: `src/analysis/notebook/cell_evolution.ipynb`
+- Multi-room cycles experiment: `uv run cycles-experiment` and `src/cycles/notebook/cycles_experiment.ipynb`
+
+Checkpoints, plots, and results are written to `ckpts/`, `plots/`, and `results/` at the repo root.
 
 ## Related Projects
-The RNN used in this project is from [NN4Neurosim](https://github.com/NN4Neurosim/nn4n), a PyTorch-based framework that provides easy-to-use APIs for implementing complex, biologically plausible recurrent networks. For reproducibility, we forked the RNN from the `nn4n` folder. Further details are available in the [NN4Neurosim documentation](https://nn4n.org). 
+The RNN used in this project is from [NN4Neurosim](https://github.com/NN4Neurosim/nn4n), vendored under `src/models/nn4n/` (imported as `nn4n`).
 
 ## Citation
 If you find this code or [NN4Neurosim](https://github.com/NN4Neurosim/nn4n) useful in your research, please consider citing the following paper:

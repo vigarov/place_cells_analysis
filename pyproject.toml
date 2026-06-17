@@ -17,20 +17,23 @@ dependencies = [
 ]
 
 [project.scripts]
-generate-room = "trajectories.src.generate_room:main"
+generate-room = "trajectories.generate_room:main"
 generate-cycles-rooms = "scripts.generate_cycles_rooms:main"
 cycles-experiment = "cycles.cycles_experiment:main"
 truncate-cycles-results = "cycles.truncate_cycles_results:main"
 estimate-gaussians-rf = "cycles.estimate_gaussians_rf:main"
+benchmark-step-size = "scripts.benchmark_step_size:main"
 
 [build-system]
 requires = ["setuptools >= 64"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["nn4n*", "trajectories*", "cell_evolutions*", "cycles*", "scripts*"]
+[tool.setuptools]
+package-dir = { "" = "src", "nn4n" = "src/models/nn4n" }
 
+[tool.setuptools.packages.find]
+where = ["src", "src/models"]
+include = ["analysis*", "cycles*", "core*", "trajectories*", "scripts*", "models*", "nn4n*"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
