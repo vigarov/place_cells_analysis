@@ -25,7 +25,7 @@ from pathlib import Path
 
 from core.paths import ROOT
 from cycles.cycles_data import load_manifest
-from cycles.cycles_paths import CKPT_DIR, ROOMS_DIR, resolve_cycles_paths
+from cycles.cycles_paths import ROOMS_DIR, resolve_cycles_paths
 from cycles.cycles_train import (
     CyclesConfig,
     CyclesExperimentRunConfig,
@@ -136,13 +136,14 @@ def main(argv: list[str] | None = None) -> None:
     paths = resolve_cycles_paths(config)
     validate_checkpoint_every_k_rooms(config.n_rooms, args.checkpoint_every_k_rooms)
 
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    paths.ckpt_dir.mkdir(parents=True, exist_ok=True)
     paths.results_dir.mkdir(parents=True, exist_ok=True)
     paths.plots_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = load_manifest()
     print(f"Config: {config_label}")
     print(f"Room data: {ROOMS_DIR}")
+    print(f"Checkpoints: {paths.ckpt_dir}")
     print(f"Results: {paths.results_dir}")
     print(f"Plots: {paths.plots_dir}")
     print(f"Rooms in manifest: {manifest.n_rooms}, trial steps: {manifest.trial_steps}")

@@ -14,9 +14,6 @@ from core.training import TrainMode, resolve_n_segments
 from cycles.constants import CYCLES_TRIAL_DURATION_S, STEP_SIZE
 
 ROOMS_DIR = DATA_DIR / "cycles"
-CKPT_DIR = CKPTS_DIR / "cycles"
-INDIV_CKPT_DIR = CKPT_DIR / "indiv"
-ROOM_MAPS_PATH = CKPT_DIR / "room_maps.json"
 MANIFEST_PATH = ROOMS_DIR / "manifest.json"
 
 # Backward-compatible alias (room data directory)
@@ -25,10 +22,14 @@ CYCLES_DIR = ROOMS_DIR
 CYCLES_SUFFIX_TEMPLATE = "!DUR_!NSEG_!SS"
 CYCLES_RESULTS_BASE = _ROOT_RESULTS_DIR / "cycles"
 CYCLES_PLOTS_BASE = _ROOT_PLOTS_DIR / "cycles"
+CYCLES_CKPT_BASE = CKPTS_DIR / "cycles"
 
 # Unresolved template paths (use `resolve_cycles_paths` at runtime).
 RESULTS_DIR = CYCLES_RESULTS_BASE / CYCLES_SUFFIX_TEMPLATE
 PLOTS_DIR = CYCLES_PLOTS_BASE / CYCLES_SUFFIX_TEMPLATE
+CKPT_DIR = CYCLES_CKPT_BASE / CYCLES_SUFFIX_TEMPLATE
+INDIV_CKPT_DIR = CKPT_DIR / "indiv"
+ROOM_MAPS_PATH = CKPT_DIR / "room_maps.json"
 GAUSSIAN_EVOLUTION_PLOTS_DIR = PLOTS_DIR / "gaussian_evolution"
 
 
@@ -41,12 +42,15 @@ class _CyclesPathConfig(Protocol):
 
 @dataclass(frozen=True)
 class CyclesPaths:
-    """Resolved results/plots directories for one cycles run configuration."""
+    """Resolved results/plots/checkpoint directories for one cycles run configuration."""
 
     suffix: str
     results_dir: Path
     plots_dir: Path
     gaussian_evolution_plots_dir: Path
+    ckpt_dir: Path
+    indiv_ckpt_dir: Path
+    room_maps_path: Path
 
 
 def resolve_cycles_suffix(
@@ -81,7 +85,7 @@ def resolve_cycles_suffix(
 
 
 def resolve_cycles_paths(config: _CyclesPathConfig) -> CyclesPaths:
-    """Resolve tagged results/plots dirs for a `CyclesConfig` (or compatible object)."""
+    """Resolve tagged results/plots/checkpoint dirs for a `CyclesConfig`."""
     suffix = resolve_cycles_suffix(
         trajectory_duration_s=config.trajectory_duration_s,
         n_segments=config.n_segments,
@@ -89,9 +93,13 @@ def resolve_cycles_paths(config: _CyclesPathConfig) -> CyclesPaths:
         train_mode=config.train_mode,
     )
     plots_dir = CYCLES_PLOTS_BASE / suffix
+    ckpt_dir = CYCLES_CKPT_BASE / suffix
     return CyclesPaths(
         suffix=suffix,
         results_dir=CYCLES_RESULTS_BASE / suffix,
         plots_dir=plots_dir,
         gaussian_evolution_plots_dir=plots_dir / "gaussian_evolution",
+        ckpt_dir=ckpt_dir,
+        indiv_ckpt_dir=ckpt_dir / "indiv",
+        room_maps_path=ckpt_dir / "room_maps.json",
     )

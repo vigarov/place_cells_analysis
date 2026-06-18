@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from cycles.cycles_paths import CKPT_DIR, RESULTS_DIR, ROOMS_DIR, resolve_cycles_paths
+from cycles.cycles_paths import RESULTS_DIR, ROOMS_DIR, resolve_cycles_paths
 from cycles.constants import STEP_SIZE
 from core.utils import compute_ratemap
 from models.utils import build_rae
@@ -499,10 +499,12 @@ def run_cycles_experiment(
     """
     Run the full cycles protocol: train in each shuffled room visit, record after each.
 
-    Saves `results/cycles_ratemaps.npz`, periodic training snapshots under
-    `ckpts/indiv/c<C>/r<R>_ridx<I>_{model,optim,rng}.pth` every
+    Saves `results/cycles/<suffix>/cycles_ratemaps.npz`, periodic training
+    snapshots under
+    `ckpts/cycles/<suffix>/indiv/c<C>/r<R>_ridx<I>_{model,optim,rng}.pth` every
     `checkpoint_every_k_rooms` rooms within a cycle (requires
-    `n_rooms % checkpoint_every_k_rooms == 0`), and `ckpts/room_maps.json`.
+    `n_rooms % checkpoint_every_k_rooms == 0`), and
+    `ckpts/cycles/<suffix>/room_maps.json`.
 
     Partial rate-map NPZs are written every `save_every_k_cycles` completed cycles
     (unchanged). Resume loads the partial rate maps to find `n_completed`, then
@@ -516,7 +518,7 @@ def run_cycles_experiment(
     device = config.resolve_device()
     paths = resolve_cycles_paths(config)
     rooms_dir = Path(rooms_dir or cycles_dir or ROOMS_DIR)
-    ckpt_dir = Path(ckpt_dir or CKPT_DIR)
+    ckpt_dir = Path(ckpt_dir or paths.ckpt_dir)
     results_dir = Path(results_dir or paths.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
