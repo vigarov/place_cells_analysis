@@ -13,12 +13,12 @@
     "device": null,
   
     "train_mode": "indiv_traj",
-    "trajectory_duration_s": 600.0,
+    "trajectory_duration_s": 200.0,
     "n_segments": 8,
     "step_size": 500,
   
     "n_rooms": 20,
-    "n_cycles": 30
+    "n_cycles": 10
   },
   "run": {
     "save_every_k_cycles": 3,

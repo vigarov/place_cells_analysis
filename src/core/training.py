@@ -33,6 +33,7 @@ class _TrainParams(Protocol):
     lambda_mse: float
     lambda_fr: float
     train_mode: TrainMode
+    n_segments: int | None
 
 
 @dataclass
@@ -45,6 +46,7 @@ class TrainConfig:
     lambda_fr: float = 200.0
     learning_rate: float = 5e-4
     train_mode: TrainMode = "default"
+    n_segments: int | None = None
 
 
 def rebatch_trajectories(
@@ -63,6 +65,13 @@ def rebatch_trajectories(
 
 def trajectory_rebatch_params(train_mode: TrainMode) -> int:
     return 4 if train_mode == "default" else 8
+
+
+def resolve_n_segments(config: _TrainParams) -> int:
+    """Rebatch count per trajectory; falls back to ``train_mode`` defaults (4 or 8)."""
+    if config.n_segments is not None:
+        return config.n_segments
+    return trajectory_rebatch_params(config.train_mode)
 
 
 def rebatch_for_mode(
@@ -135,6 +144,7 @@ def train_room_visit(
     """
     # the following comments assume we have 128 trajectories of 600s each, 
     # and that we have dt = 0.5 and step_size = 20 (-->1s of training per weight update)
+    n_segments = resolve_n_segments(config)
     if config.train_mode == "default":
         # by default, we:
         # 1) sub-divide each 600s trajectory in 4 150s segments that we consider independend (-> can train in parallel)
@@ -143,7 +153,8 @@ def train_room_visit(
         # hence, each training step encopasses gradient updates from different trajectories at the same time
         #
         # in total, for one room with 1s train segments, we have 150 updates only
-        traj = rebatch_trajectories(raw_traj_coord, n_segments=4)
+
+        traj = rebatch_trajectories(raw_traj_coord, n_segments=n_segments) # by default, 4
         train_steps(rae, optimizer, traj, wsm, device, config, mask_generator)
     else:
         # In indiv traj, we don't want to mix trajectories within each other. However, we
@@ -154,7 +165,9 @@ def train_room_visit(
         # 
         # in total, for one room with 1s train segments, we have 75*128 = 9600 updates
         for i in range(raw_traj_coord.shape[0]):
-            traj_i = rebatch_trajectories(raw_traj_coord[i : i + 1], n_segments=8)
+            traj_i = rebatch_trajectories(
+                raw_traj_coord[i : i + 1], n_segments=n_segments # by default, 8
+            )
             train_steps(rae, optimizer, traj_i, wsm, device, config, mask_generator)
 
 

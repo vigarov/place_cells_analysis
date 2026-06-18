@@ -1,7 +1,4 @@
 """Train RAE across multi-room cycles and record rate maps (600 trials)."""
-
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -11,15 +8,15 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from cycles.cycles_paths import CKPT_DIR, RESULTS_DIR, ROOMS_DIR
+from cycles.cycles_paths import CKPT_DIR, RESULTS_DIR, ROOMS_DIR, resolve_cycles_paths
 from cycles.constants import STEP_SIZE
 from core.utils import compute_ratemap
 from models.utils import build_rae
 from core.training import (
     TrainMode,
     rebatch_trajectories,
+    resolve_n_segments,
     train_room_visit,
-    trajectory_rebatch_params,
 )
 from cycles.cycles_data import (
     build_visit_schedule,
@@ -78,8 +75,11 @@ class CyclesConfig:
     record_n_segments: int | None = None  # None -> derive from trajectory or use all
 
     # If set, train and record rate maps on the first N seconds of each visit
-    # (e.g. 400 s of the 600 s trajectories from ``generate-cycles-rooms``).
+    # (e.g. 400 s of the 600 s trajectories from `generate-cycles-rooms`).
     trajectory_duration_s: float | None = None
+
+    # Sub-divisions per trajectory for rebatching (default: 4 for `default`, 8 for `indiv_traj`).
+    n_segments: int | None = None
 
     train_mode: TrainMode = "default"
 
@@ -97,7 +97,7 @@ class CyclesConfig:
 
 @dataclass
 class CyclesExperimentRunConfig:
-    """Cycles hyperparameters plus CLI/runtime options for ``cycles-experiment``."""
+    """Cycles hyperparameters plus CLI/runtime options for `cycles-experiment`."""
 
     cycles: CyclesConfig
     save_every_k_cycles: int = 3
@@ -110,13 +110,13 @@ _RUN_CONFIG_FIELDS = {"save_every_k_cycles", "checkpoint_every_k_rooms", "resume
 
 
 def cycles_config_from_dict(raw: dict[str, Any]) -> CyclesConfig:
-    """Build ``CyclesConfig`` from a JSON object (unknown keys are ignored)."""
+    """Build `CyclesConfig` from a JSON object (unknown keys are ignored)."""
     kwargs = {k: v for k, v in raw.items() if k in _CYCLES_CONFIG_FIELDS}
     return CyclesConfig(**kwargs)
 
 
 def load_cycles_experiment_config(path: Path | str) -> CyclesExperimentRunConfig:
-    """Load ``input_configs/*.json`` for the cycles training CLI."""
+    """Load `input_configs/*.json` for the cycles training CLI."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Config root must be a JSON object: {path}")
@@ -138,7 +138,7 @@ def validate_trajectory_duration(
     duration_s: float | None,
     *,
     manifest,
-    train_mode: TrainMode,
+    n_segments: int,
 ) -> None:
     if duration_s is None:
         return
@@ -150,11 +150,10 @@ def validate_trajectory_duration(
             f"({manifest.trial_duration_s}s)."
         )
     n_steps = trial_steps_from_duration(duration_s, manifest.dt_s)
-    n_seg = trajectory_rebatch_params(train_mode)
-    if n_steps % n_seg != 0:
+    if n_steps % n_segments != 0:
         raise ValueError(
             f"trajectory_duration_s={duration_s} → {n_steps} steps, not divisible by "
-            f"{n_seg} rebatch segments for train_mode={train_mode!r}."
+            f"n_segments={n_segments}."
         )
 
 
@@ -515,9 +514,10 @@ def run_cycles_experiment(
     config = config or CyclesConfig()
     validate_checkpoint_every_k_rooms(config.n_rooms, checkpoint_every_k_rooms)
     device = config.resolve_device()
+    paths = resolve_cycles_paths(config)
     rooms_dir = Path(rooms_dir or cycles_dir or ROOMS_DIR)
     ckpt_dir = Path(ckpt_dir or CKPT_DIR)
-    results_dir = Path(results_dir or RESULTS_DIR)
+    results_dir = Path(results_dir or paths.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = load_manifest(rooms_dir / "manifest.json")
@@ -525,10 +525,11 @@ def run_cycles_experiment(
         raise ValueError(
             f"config.n_rooms={config.n_rooms} exceeds manifest ({manifest.n_rooms} rooms)."
         )
+    n_seg = resolve_n_segments(config)
     validate_trajectory_duration(
         config.trajectory_duration_s,
         manifest=manifest,
-        train_mode=config.train_mode,
+        n_segments=n_seg,
     )
 
     schedule = build_visit_schedule(config.n_cycles, config.n_rooms, seed=config.schedule_seed)
@@ -542,7 +543,6 @@ def run_cycles_experiment(
         config.trajectory_duration_s,
         dt=manifest.dt_s,
     )
-    n_seg = trajectory_rebatch_params(config.train_mode)
     traj0_rebatched = rebatch_trajectories(traj0, n_segments=n_seg)
     rae = build_rae(config.n_wsm_cells, config.n_hidden, device)
     optimizer = torch.optim.Adam(rae.parameters(), lr=config.learning_rate)
@@ -883,6 +883,7 @@ def load_cycles_result(
     results_dir: Path | None = None,
     *,
     path: Path | str | None = None,
+    config: CyclesConfig | None = None,
 ) -> CyclesResult:
     """
     Load experiment results from disk.
@@ -893,10 +894,14 @@ def load_cycles_result(
         Directory containing `cycles_ratemaps.npz` (ignored if `path` is set).
     path
         Explicit `.npz` file, e.g. `results/cycles_ratemaps_truncated_20.npz`.
+    config
+        When set, resolve tagged `results/cycles/<suffix>/` from run hyperparameters.
     """
     if path is not None:
         npz_path = Path(path)
     else:
+        if results_dir is None and config is not None:
+            results_dir = resolve_cycles_paths(config).results_dir
         npz_path = Path(results_dir or RESULTS_DIR) / DEFAULT_CYCLES_RESULTS_NAME
 
     with np.load(npz_path) as data:

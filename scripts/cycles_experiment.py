@@ -3,10 +3,10 @@
 Run the Wang et al. (NeurIPS 2024) multi-room cycles experiment (training only).
 
 20 rooms x 30 cycles → 600 recorded rate-map trials. Saves checkpoints and
-``results/cycles/cycles_ratemaps.npz``. Use ``src/cycles/notebook/cycles_experiment.ipynb``
+`results/cycles/cycles_ratemaps.npz`. Use `src/cycles/notebook/cycles_experiment.ipynb`
 for Supplemental Figures 1 & 2.
 
-Prerequisites: generate rooms under ``data/cycles/`` with::
+Prerequisites: generate rooms under `data/cycles/` with::
 
     uv run generate-cycles-rooms
 
@@ -20,15 +20,12 @@ Usage::
 
     uv run cycles-experiment --load-only
 """
-
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
 from core.paths import ROOT
 from cycles.cycles_data import load_manifest
-from cycles.cycles_paths import CKPT_DIR, RESULTS_DIR, ROOMS_DIR
+from cycles.cycles_paths import CKPT_DIR, ROOMS_DIR, resolve_cycles_paths
 from cycles.cycles_train import (
     CyclesConfig,
     CyclesExperimentRunConfig,
@@ -136,24 +133,28 @@ def main(argv: list[str] | None = None) -> None:
 
     run_config = _apply_cli_overrides(run_config, args)
     config = run_config.cycles
+    paths = resolve_cycles_paths(config)
     validate_checkpoint_every_k_rooms(config.n_rooms, args.checkpoint_every_k_rooms)
 
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    paths.results_dir.mkdir(parents=True, exist_ok=True)
+    paths.plots_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = load_manifest()
     print(f"Config: {config_label}")
     print(f"Room data: {ROOMS_DIR}")
-    print(f"Results: {RESULTS_DIR}")
+    print(f"Results: {paths.results_dir}")
+    print(f"Plots: {paths.plots_dir}")
     print(f"Rooms in manifest: {manifest.n_rooms}, trial steps: {manifest.trial_steps}")
     print(f"Config: {config}")
     print(f"Indiv checkpoint every {args.checkpoint_every_k_rooms} room(s) per cycle")
 
     if args.load_only:
-        result = load_cycles_result()
+        result = load_cycles_result(results_dir=paths.results_dir, config=config)
     else:
         result = run_cycles_experiment(
             config,
+            results_dir=paths.results_dir,
             resume=run_config.resume,
             save_every_k_cycles=args.save_every_k_cycles,
             checkpoint_every_k_rooms=args.checkpoint_every_k_rooms,
