@@ -19,12 +19,12 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
-from analysis.cell_evolution_analysis import (
+from analysis.sum_gaussians_core import (
     _aic_from_least_squares,
     _make_sum_gaussians_model,
 )
 from cycles.cycles_paths import RESULTS_DIR
-from cycles.cycles_train import discover_truncated_ratemaps_series
+from cycles.ratemaps_io import discover_truncated_ratemaps_series
 from scripts.estimate_gaussians_rf import (
     DEFAULT_OUTPUT_NAME,
     DEFAULT_TOTAL_CYCLES,

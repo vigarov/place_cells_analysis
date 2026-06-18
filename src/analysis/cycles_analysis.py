@@ -1,7 +1,4 @@
-"""Analysis for Suppl. Figs. 1–2 (population vectors and correlations)."""
-
-from __future__ import annotations
-
+"""Analysis for Suppl. Figs. 1-2 (population vectors and correlations)."""
 import numpy as np
 
 from cycles.constants import DEFAULT_PADDING, POPULATION_BIN_SIZE_CM
@@ -10,7 +7,7 @@ from cycles.constants import DEFAULT_PADDING, POPULATION_BIN_SIZE_CM
 def trial_metadata_from_schedule(
     schedule: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """``cycle_ids`` and ``room_ids`` in visit order (cycle-major, shuffled rooms)."""
+    """`cycle_ids` and `room_ids` in visit order (cycle-major, shuffled rooms)."""
     n_cycles, n_rooms = schedule.shape
     cycle_ids = np.repeat(np.arange(n_cycles), n_rooms)
     room_ids = schedule.reshape(-1)
@@ -54,15 +51,15 @@ def ratemap_to_binned_field(
     bin_size_cm: int = POPULATION_BIN_SIZE_CM,
 ) -> np.ndarray:
     """
-    Average firing rates in ``room_size_cm / bin_size_cm`` bins per unit.
+    Average firing rates in `room_size_cm / bin_size_cm` bins per unit.
 
     Parameters
     ----------
-    ratemap : ndarray, shape ``(n_units, H, W)``
+    ratemap : ndarray, shape `(n_units, H, W)`
 
     Returns
     -------
-    ndarray, shape ``(n_units, n_bins, n_bins)``
+    ndarray, shape `(n_units, n_bins, n_bins)`
     """
     if room_size_cm % bin_size_cm != 0:
         raise ValueError("room_size_cm must be divisible by bin_size_cm")
@@ -88,7 +85,7 @@ def population_vectors_from_ratemaps(
 
     Returns
     -------
-    ndarray, shape ``(n_trials, n_units * n_bins * n_bins)``
+    ndarray, shape `(n_trials, n_units * n_bins * n_bins)`
     """
     n_bins = room_size_cm // bin_size_cm
     b = bin_size_cm
@@ -107,7 +104,7 @@ def pearson_correlation_matrix(vectors: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    vectors : ndarray, shape ``(n_trials, n_features)``
+    vectors : ndarray, shape `(n_trials, n_features)`
     """
     x = vectors.astype(np.float64)
     x = x - x.mean(axis=1, keepdims=True)

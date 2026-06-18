@@ -3,7 +3,7 @@
 Fit N-Gaussian receptive fields to cycles experiment rate maps.
 
 For each visit and hidden unit, fits a sum of -n_gaussians- independent 2D
-Gaussians (same routine as -analysis/cell_evolution_analysis.py-).
+Gaussians (same routine as `analysis.sum_gaussians`).
 Writes -gaussian_rf_fits.npz- next to the input results file or truncated-dir.
 Each output includes -r2-, -gaussian_params-, -aic-, and per-rate-map
 -signal_mean- / -signal_max- / -signal_std-.
@@ -27,14 +27,15 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
-from analysis.cell_evolution_analysis import (
+from analysis.sum_gaussians import fit_sum_gaussians
+from analysis.sum_gaussians_core import (
     _aic_from_least_squares,
     _make_sum_gaussians_model,
-    fit_sum_gaussians,
 )
-from cycles.cycles_paths import RESULTS_DIR
-from cycles.cycles_train import (
+from cycles.ratemaps_io import (
+    DEFAULT_CYCLES_RESULTS_DIR,
     DEFAULT_CYCLES_RESULTS_NAME,
+    DEFAULT_CYCLES_RESULTS_PATH,
     discover_truncated_ratemaps_series,
 )
 
@@ -77,7 +78,7 @@ def _pool_worker_init() -> None:
 
 
 def _default_input_path() -> Path:
-    return RESULTS_DIR / DEFAULT_CYCLES_RESULTS_NAME
+    return DEFAULT_CYCLES_RESULTS_PATH
 
 
 def _output_path(base: Path) -> Path:
@@ -883,7 +884,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.truncated_dir:
         if args.input is None:
-            input_path = RESULTS_DIR
+            input_path = DEFAULT_CYCLES_RESULTS_DIR
         else:
             input_path = args.input
     else:

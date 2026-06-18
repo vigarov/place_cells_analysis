@@ -1,14 +1,11 @@
 """Plot helpers for `analyse_cycles.ipynb` (Gaussian RF evolution)."""
-
-from __future__ import annotations
-
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from cycles.gaussian_fit_cycle_analysis import (
+from analysis.gaussian_fit_cycle_analysis import (
     DEFAULT_GAUSSIAN_FIELD_SHAPE,
     GAUSSIAN_PARAM_NAMES,
     AicR2Correlation,
@@ -115,7 +112,7 @@ def plot_gaussian_evolution_for_room(
     """
     Plot Gaussian components and their sum across visits to one room.
 
-    Rows: `g1`, `g2`, … then `sum`. Columns: cycles (visits) in order.
+    Rows: `g1`, `g2`, ... then `sum`. Columns: cycles (visits) in order.
     Visits with failed fits (`NaN` params) show a grey panel.
     """
     if visits.empty:
@@ -309,7 +306,7 @@ def _outlier_decomposition_row_layout(
     n_gaussians: int,
 ) -> list[tuple[str, str]]:
     """
-    Vertical decomposition layout: gt, sum, `=`, g1, `+`, g2, …
+    Vertical decomposition layout: gt, sum, `=`, g1, `+`, g2, ...
 
     Returns `(kind, key)` pairs with `kind` `'image'` or `'op'`.
     """
@@ -430,7 +427,7 @@ def plot_outlier_gaussian_room_evolution(
     """
     GT + Gaussian decomposition across room visits for one outlier point.
 
-    Rows: ground truth, Gaussian sum, `=`, `g1`, `+`, `g2`, …
+    Rows: ground truth, Gaussian sum, `=`, `g1`, `+`, `g2`, ...
     Highlights the selection cycle column: green = top R² tail, red = bottom.
     """
     if visits.empty:

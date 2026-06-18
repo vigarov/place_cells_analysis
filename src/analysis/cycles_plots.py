@@ -1,7 +1,4 @@
 """Plots for Supplemental Figures 1 and 2."""
-
-from __future__ import annotations
-
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -19,12 +16,12 @@ def plot_suppl_fig1_correlation(
     title: str = "Suppl. Fig. 1 — cross-correlation of all trials",
 ) -> plt.Figure:
     """
-    Heatmap of trial–trial Pearson correlations (600×600 when fully run).
+    Heatmap of trial-trial Pearson correlations (600x600 when fully run).
 
-    Expects trials sorted cycle-major (see ``reorder_trials_by_cycle``). Cycle 0
-    is at the top-left (``origin='upper'``). If *cycle_ids* is given, draw
+    Expects trials sorted cycle-major (see `reorder_trials_by_cycle`). Cycle 0
+    is at the top-left (`origin='upper'`). If *cycle_ids* is given, draw
     cycle block boundaries and label axes from the cycles present in the data
-    (e.g. truncated runs only show C0 … C9, not the full protocol length).
+    (e.g. truncated runs only show C0 ... C9, not the full protocol length).
     """
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 7))

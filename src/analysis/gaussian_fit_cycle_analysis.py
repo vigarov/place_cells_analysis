@@ -1,15 +1,12 @@
 """Analysis helpers for `analyse_cycles.ipynb` (Gaussian RF fits)."""
-
-from __future__ import annotations
-
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
-from analysis.cell_evolution_analysis import _gaussian_2d
-from cycles.cycles_train import parse_truncated_ratemaps_filename
+from analysis.sum_gaussians_core import _gaussian_2d
+from cycles.ratemaps_io import parse_truncated_ratemaps_filename
 
 GAUSSIAN_PARAM_NAMES = ("amplitude", "mu_x", "mu_y", "sigma_x", "sigma_y")
 R2BandName = str  # "top" | "bottom"
@@ -21,7 +18,7 @@ def gaussian_param_column_names(
     n_gaussians: int,
     param_names: tuple[str, ...] = GAUSSIAN_PARAM_NAMES,
 ) -> list[str]:
-    """Column names `g1_amplitude`, … for a flattened Gaussian-params table."""
+    """Column names `g1_amplitude`, ... for a flattened Gaussian-params table."""
     return [
         f"g{k + 1}_{name}" for k in range(n_gaussians) for name in param_names
     ]
@@ -32,7 +29,7 @@ def build_cell_receptive_fields_df(path: Path | str) -> pd.DataFrame:
     Long-form table of per-visit Gaussian RF fits.
 
     Index: `(visit_idx, cell_idx)`. Gaussian parameters appear as columns
-    `g1_amplitude`, `g1_mu_x`, …
+    `g1_amplitude`, `g1_mu_x`, ...
     """
     path = Path(path)
     with np.load(path) as data:

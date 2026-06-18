@@ -20,6 +20,7 @@ dependencies = [
 generate-room = "trajectories.generate_room:main"
 generate-cycles-rooms = "scripts.generate_cycles_rooms:main"
 cycles-experiment = "scripts.cycles_experiment:main"
+recreate-paper-plots-cycles = "scripts.recreate_paper_plots_cycles:main"
 truncate-cycles-results = "cycles.truncate_cycles_results:main"
 estimate-gaussians-rf = "scripts.estimate_gaussians_rf:main"
 benchmark-step-size = "scripts.benchmark_step_size:main"
