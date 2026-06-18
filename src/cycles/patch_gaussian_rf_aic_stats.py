@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Temporary patch: backfill ``aic`` and per-rate-map signal stats in ``gaussian_rf_fits.npz``.
+Temporary patch: backfill -aic- and per-rate-map signal stats in -gaussian_rf_fits.npz-.
 
-Loads each ``cycles_ratemaps_truncated_*.npz`` one at a time (rate maps are large),
-records ``mean`` / ``max`` / ``std`` of finite pixels in each rate map, and for rows
-with saved ``gaussian_params`` re-evaluates the Gaussian sum to compute AIC (same
-formula as ``analysis/cell_evolution_analysis.py``).
+Loads each -cycles_ratemaps_truncated_*.npz- one at a time (rate maps are large),
+records -mean- / -max- / -std- of finite pixels in each rate map, and for rows
+with saved -gaussian_params- re-evaluates the Gaussian sum to compute AIC (same
+formula as -analysis/cell_evolution_analysis.py-).
 
 Usage::
 
@@ -13,9 +13,6 @@ Usage::
 
     uv run python cycles/patch_gaussian_rf_aic_stats.py --results-dir cycles/results
 """
-
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
@@ -28,7 +25,7 @@ from analysis.cell_evolution_analysis import (
 )
 from cycles.cycles_paths import RESULTS_DIR
 from cycles.cycles_train import discover_truncated_ratemaps_series
-from cycles.estimate_gaussians_rf import (
+from scripts.estimate_gaussians_rf import (
     DEFAULT_OUTPUT_NAME,
     DEFAULT_TOTAL_CYCLES,
     _n_rooms_from_truncated_file,
@@ -36,7 +33,7 @@ from cycles.estimate_gaussians_rf import (
 
 
 def _signal_stats(field: np.ndarray) -> tuple[float, float, float]:
-    """``mean``, ``max``, ``std`` over finite pixels (``nan`` if none)."""
+    """-mean-, -max-, -std- over finite pixels (-nan- if none)."""
     vals = field[np.isfinite(field)]
     if vals.size == 0:
         return np.nan, np.nan, np.nan
@@ -49,7 +46,7 @@ def _aic_from_saved_params(
     *,
     n_gaussians: int,
 ) -> float:
-    """AIC for a fixed parameter vector ``(n_gaussians, 5)``."""
+    """AIC for a fixed parameter vector -(n_gaussians, 5)-."""
     if not np.all(np.isfinite(params)):
         return np.nan
 
@@ -79,10 +76,10 @@ def _load_fits_payload(fits_path: Path) -> dict[str, np.ndarray | int | str]:
 
 def _atomic_save_npz(path: Path, payload: dict[str, np.ndarray | int | str]) -> None:
     """
-    Write ``path`` atomically via a sibling ``.npz`` temp file.
+    Write -path- atomically via a sibling -.npz- temp file.
 
-    ``np.savez_compressed`` appends ``.npz`` when the path lacks that suffix
-    (e.g. ``foo.tmp`` → ``foo.tmp.npz``), so the temp name must end in ``.npz``.
+    -np.savez_compressed- appends -.npz- when the path lacks that suffix
+    (e.g. -foo.tmp- → -foo.tmp.npz-), so the temp name must end in -.npz-.
     """
     path = Path(path)
     tmp_path = path.with_name(f"{path.stem}.patch.tmp.npz")

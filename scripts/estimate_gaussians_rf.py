@@ -2,11 +2,11 @@
 """
 Fit N-Gaussian receptive fields to cycles experiment rate maps.
 
-For each visit and hidden unit, fits a sum of ``n_gaussians`` independent 2D
-Gaussians (same routine as ``analysis/cell_evolution_analysis.py``).
-Writes ``gaussian_rf_fits.npz`` next to the input results file or truncated-dir.
-Each output includes ``r2``, ``gaussian_params``, ``aic``, and per-rate-map
-``signal_mean`` / ``signal_max`` / ``signal_std``.
+For each visit and hidden unit, fits a sum of -n_gaussians- independent 2D
+Gaussians (same routine as -analysis/cell_evolution_analysis.py-).
+Writes -gaussian_rf_fits.npz- next to the input results file or truncated-dir.
+Each output includes -r2-, -gaussian_params-, -aic-, and per-rate-map
+-signal_mean- / -signal_max- / -signal_std-.
 
 Usage::
 
@@ -18,9 +18,6 @@ Usage::
 
     uv run estimate-gaussians-rf --device cpu --n-processes auto
 """
-
-from __future__ import annotations
-
 import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -49,7 +46,7 @@ _PARAM_NAMES = ("amplitude", "mu_x", "mu_y", "sigma_x", "sigma_y")
 
 
 def default_cpu_process_count(*, reserve: int = CPU_WORKER_RESERVE) -> int:
-    """Worker count for ``--n-processes auto``: ``max(1, cpu_count() - reserve)``."""
+    """Worker count for ---n-processes auto-: -max(1, cpu_count() - reserve)-."""
     count = os.cpu_count() or 1
     return max(1, count - reserve)
 
@@ -92,7 +89,7 @@ def _partial_output_path(base: Path, part: int, n_parts: int) -> Path:
 
 
 def visit_chunk_bounds(n_visits: int, k_parts: int) -> list[tuple[int, int]]:
-    """Split ``n_visits`` into ``k_parts`` contiguous slices (last gets remainder)."""
+    """Split -n_visits- into -k_parts- contiguous slices (last gets remainder)."""
     if k_parts < 1:
         raise ValueError(f"memory-split must be >= 1, got {k_parts}")
     chunk = n_visits // k_parts
@@ -135,7 +132,7 @@ def _load_metadata_arrays(
 
 
 def _curve_chunk_bounds(total_curves: int, chunk_size: int) -> list[tuple[int, int]]:
-    """``(flat_start, flat_end)`` pairs covering ``[0, total_curves)``."""
+    """-(flat_start, flat_end)- pairs covering -[0, total_curves)-."""
     bounds: list[tuple[int, int]] = []
     for start in range(0, total_curves, chunk_size):
         bounds.append((start, min(start + chunk_size, total_curves)))
@@ -155,10 +152,10 @@ def _fit_curves_chunk_worker(
     list[tuple[int, int, float, np.ndarray, float, float, float, float]],
 ]:
     """
-    Fit up to ``CURVES_PER_WORKER_CHUNK`` (visit, cell) rate maps (module-level).
+    Fit up to -CURVES_PER_WORKER_CHUNK- (visit, cell) rate maps (module-level).
 
-    Returns ``(flat_start, flat_end, [(visit, cell, r2, params, aic,
-    signal_mean, signal_max, signal_std), ...])``.
+    Returns -(flat_start, flat_end, [(visit, cell, r2, params, aic,
+    signal_mean, signal_max, signal_std), ...])-.
     """
     shm = shared_memory.SharedMemory(name=shm_name)
     try:
@@ -192,7 +189,7 @@ def _safe_fit_sum_gaussians(
     n_gaussians: int,
     device: str,
 ) -> dict | None:
-    """Call :func:`fit_sum_gaussians`, returning ``None`` on any fit failure."""
+    """Call :func:`fit_sum_gaussians`, returning -None- on any fit failure."""
     try:
         return fit_sum_gaussians(field, n_gaussians=n_gaussians, device=device)
     except Exception:
@@ -200,7 +197,7 @@ def _safe_fit_sum_gaussians(
 
 
 def _signal_stats(field: np.ndarray) -> tuple[float, float, float]:
-    """``mean``, ``max``, ``std`` over finite pixels (``nan`` if none)."""
+    """-mean-, -max-, -std- over finite pixels (-nan- if none)."""
     vals = field[np.isfinite(field)]
     if vals.size == 0:
         return np.nan, np.nan, np.nan
@@ -213,7 +210,7 @@ def _aic_from_saved_params(
     *,
     n_gaussians: int,
 ) -> float:
-    """AIC for a fixed parameter vector ``(n_gaussians, 5)``."""
+    """AIC for a fixed parameter vector -(n_gaussians, 5)-."""
     if not np.all(np.isfinite(params)):
         return np.nan
 
@@ -237,7 +234,7 @@ def _aic_from_saved_params(
 
 
 def _params_from_fit(fit: dict, n_gaussians: int) -> np.ndarray:
-    """Shape ``(n_gaussians, 5)``."""
+    """Shape -(n_gaussians, 5)-."""
     out = np.full((n_gaussians, 5), np.nan, dtype=np.float64)
     for k, comp in enumerate(fit["component_params"]):
         if k >= n_gaussians:
@@ -259,8 +256,8 @@ def _fit_one_curve(
     """
     Fit one (visit, cell) rate map.
 
-    Returns ``r2``, ``params``, ``aic``, ``signal_mean``, ``signal_max``,
-    ``signal_std``. Failed fits leave ``r2``, ``params``, and ``aic`` as NaN
+    Returns -r2-, -params-, -aic-, -signal_mean-, -signal_max-,
+    -signal_std-. Failed fits leave -r2-, -params-, and -aic- as NaN
     but still record signal stats when the field has finite pixels.
     """
     signal_mean, signal_max, signal_std = _signal_stats(field)
@@ -429,19 +426,19 @@ def fit_ratemaps(
     """
     Fit Gaussians for each (visit, cell).
 
-    With ``device='cpu'`` and ``n_processes > 1``, fits one visit per worker using
-    a shared-memory view of ``ratemaps``.
+    With -device='cpu'- and -n_processes > 1-, fits one visit per worker using
+    a shared-memory view of -ratemaps-.
 
     Returns
     -------
     r2
-        ``(n_visits, n_cells)``
+        -(n_visits, n_cells)-
     gaussian_params
-        ``(n_visits, n_cells, n_gaussians, 5)``
+        -(n_visits, n_cells, n_gaussians, 5)-
     aic
-        ``(n_visits, n_cells)``
+        -(n_visits, n_cells)-
     signal_mean, signal_max, signal_std
-        Per-rate-map signal stats over finite pixels, each ``(n_visits, n_cells)``
+        Per-rate-map signal stats over finite pixels, each -(n_visits, n_cells)-
     """
     if device == "cpu" and n_processes > 1:
         return _fit_ratemaps_parallel(

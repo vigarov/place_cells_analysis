@@ -56,6 +56,24 @@ def trial_steps_from_duration(duration_s: float, dt: float = DT) -> int:
     return int(round(duration_s / dt))
 
 
+def truncate_trajectory_to_duration(
+    traj_coord: np.ndarray,
+    duration_s: float | None,
+    *,
+    dt: float = DT,
+) -> np.ndarray:
+    """Keep only the first -duration_s- seconds along the time axis."""
+    if duration_s is None:
+        return traj_coord
+    n_steps = trial_steps_from_duration(duration_s, dt)
+    if n_steps > traj_coord.shape[1]:
+        raise ValueError(
+            f"trajectory_duration_s={duration_s} requires {n_steps} steps, "
+            f"but trajectory has {traj_coord.shape[1]}."
+        )
+    return traj_coord[:, :n_steps, :]
+
+
 def load_manifest(path: Path | None = None) -> CyclesManifest:
     path = Path(path or MANIFEST_PATH)
     raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
@@ -98,7 +116,7 @@ def load_room(
     """
     Load arena map, trajectory coordinates, and WSM for one cycles room.
 
-    Room files are read from ``data/cycles/<room_name>/``.
+    Room files are read from -data/cycles/<room_name>/-.
 
     Returns
     -------

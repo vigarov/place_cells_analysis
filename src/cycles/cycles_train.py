@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -26,9 +26,12 @@ from cycles.cycles_data import (
     flatten_schedule,
     load_manifest,
     load_room,
+    trial_steps_from_duration,
+    truncate_trajectory_to_duration,
 )
 
 DEFAULT_CYCLES_RESULTS_NAME = "cycles_ratemaps.npz"
+DEFAULT_CHECKPOINT_EVERY_K_ROOMS = 10
 
 
 TRUNCATED_RATEMAPS_PREFIX = "cycles_ratemaps_truncated_"
@@ -72,7 +75,11 @@ class CyclesConfig:
     schedule_seed: int = 0
     mask_rng_seed: int = 0
 
-    record_n_segments: int | None = None  # None -> use all segments in trajectory
+    record_n_segments: int | None = None  # None -> derive from trajectory or use all
+
+    # If set, train and record rate maps on the first N seconds of each visit
+    # (e.g. 400 s of the 600 s trajectories from ``generate-cycles-rooms``).
+    trajectory_duration_s: float | None = None
 
     train_mode: TrainMode = "default"
 
@@ -89,6 +96,82 @@ class CyclesConfig:
 
 
 @dataclass
+class CyclesExperimentRunConfig:
+    """Cycles hyperparameters plus CLI/runtime options for ``cycles-experiment``."""
+
+    cycles: CyclesConfig
+    save_every_k_cycles: int = 3
+    checkpoint_every_k_rooms: int = DEFAULT_CHECKPOINT_EVERY_K_ROOMS
+    resume: bool = True
+
+
+_CYCLES_CONFIG_FIELDS = {f.name for f in fields(CyclesConfig)}
+_RUN_CONFIG_FIELDS = {"save_every_k_cycles", "checkpoint_every_k_rooms", "resume"}
+
+
+def cycles_config_from_dict(raw: dict[str, Any]) -> CyclesConfig:
+    """Build ``CyclesConfig`` from a JSON object (unknown keys are ignored)."""
+    kwargs = {k: v for k, v in raw.items() if k in _CYCLES_CONFIG_FIELDS}
+    return CyclesConfig(**kwargs)
+
+
+def load_cycles_experiment_config(path: Path | str) -> CyclesExperimentRunConfig:
+    """Load ``input_configs/*.json`` for the cycles training CLI."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config root must be a JSON object: {path}")
+
+    cycles_raw = payload.get("cycles", payload)
+    if not isinstance(cycles_raw, dict):
+        raise ValueError(f"Config 'cycles' section must be a JSON object: {path}")
+
+    run_raw = payload.get("run", {})
+    if not isinstance(run_raw, dict):
+        raise ValueError(f"Config 'run' section must be a JSON object: {path}")
+
+    cycles = cycles_config_from_dict(cycles_raw)
+    run_kwargs = {k: run_raw[k] for k in _RUN_CONFIG_FIELDS if k in run_raw}
+    return CyclesExperimentRunConfig(cycles=cycles, **run_kwargs)
+
+
+def validate_trajectory_duration(
+    duration_s: float | None,
+    *,
+    manifest,
+    train_mode: TrainMode,
+) -> None:
+    if duration_s is None:
+        return
+    if duration_s <= 0:
+        raise ValueError(f"trajectory_duration_s must be > 0, got {duration_s}")
+    if duration_s > manifest.trial_duration_s:
+        raise ValueError(
+            f"trajectory_duration_s={duration_s} exceeds manifest trial duration "
+            f"({manifest.trial_duration_s}s)."
+        )
+    n_steps = trial_steps_from_duration(duration_s, manifest.dt_s)
+    n_seg = trajectory_rebatch_params(train_mode)
+    if n_steps % n_seg != 0:
+        raise ValueError(
+            f"trajectory_duration_s={duration_s} → {n_steps} steps, not divisible by "
+            f"{n_seg} rebatch segments for train_mode={train_mode!r}."
+        )
+
+
+def resolve_record_n_segments(
+    config: CyclesConfig,
+    *,
+    traj_timesteps: int,
+) -> int:
+    if config.record_n_segments is not None:
+        return config.record_n_segments
+    if config.trajectory_duration_s is not None:
+        n_steps = trial_steps_from_duration(config.trajectory_duration_s)
+        return n_steps // config.step_size
+    return traj_timesteps // config.step_size
+
+
+@dataclass
 class CyclesResult:
     """Outputs of `run_cycles_experiment`."""
 
@@ -101,7 +184,6 @@ class CyclesResult:
 
 
 IndivComponent = Literal["model", "optim", "rng"]
-DEFAULT_CHECKPOINT_EVERY_K_ROOMS = 10
 
 
 @dataclass(frozen=True)
@@ -443,6 +525,11 @@ def run_cycles_experiment(
         raise ValueError(
             f"config.n_rooms={config.n_rooms} exceeds manifest ({manifest.n_rooms} rooms)."
         )
+    validate_trajectory_duration(
+        config.trajectory_duration_s,
+        manifest=manifest,
+        train_mode=config.train_mode,
+    )
 
     schedule = build_visit_schedule(config.n_cycles, config.n_rooms, seed=config.schedule_seed)
     cycle_ids, room_ids, visit_indices = flatten_schedule(schedule)
@@ -450,6 +537,11 @@ def run_cycles_experiment(
 
     # Probe one room for tensor shapes.
     arena0, traj0, wsm0, _ = load_room(1, manifest=manifest, rooms_dir=rooms_dir)
+    traj0 = truncate_trajectory_to_duration(
+        traj0,
+        config.trajectory_duration_s,
+        dt=manifest.dt_s,
+    )
     n_seg = trajectory_rebatch_params(config.train_mode)
     traj0_rebatched = rebatch_trajectories(traj0, n_segments=n_seg)
     rae = build_rae(config.n_wsm_cells, config.n_hidden, device)
@@ -533,9 +625,10 @@ def run_cycles_experiment(
     if ratemaps is None:
         ratemaps = np.zeros((n_visits, config.n_hidden, *arena0.shape), dtype=np.float32)
 
-    record_segments = config.record_n_segments
-    if record_segments is None:
-        record_segments = traj0_rebatched.shape[1] // config.step_size
+    record_segments = resolve_record_n_segments(
+        config,
+        traj_timesteps=traj0_rebatched.shape[1],
+    )
 
     visit_iter = range(start_visit, n_visits)
     if show_progress:
@@ -545,6 +638,11 @@ def run_cycles_experiment(
         cyc = int(cycle_ids[v])
         rid = int(room_ids[v])
         arena_map, traj_coord, wsm, _ = load_room(rid, manifest=manifest, rooms_dir=rooms_dir)
+        traj_coord = truncate_trajectory_to_duration(
+            traj_coord,
+            config.trajectory_duration_s,
+            dt=manifest.dt_s,
+        )
 
         train_room_visit(
             rae, optimizer, traj_coord, wsm, device, config, mask_generator

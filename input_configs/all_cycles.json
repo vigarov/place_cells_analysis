@@ -1,0 +1,25 @@
+{
+  "description": "Full Wang et al. (NeurIPS 2024) multi-room cycles experiment: 20 rooms x 30 cycles (600 rate-map trials). Room trajectories are generated at 600 s per visit; set trajectory_duration_s below to train and evaluate on a shorter prefix (e.g. 400 s of the stored 600 s walk).",
+  "cycles": {
+    "n_wsm_cells": 200,
+    "n_hidden": 1000,
+    "learning_rate": 0.0005,
+    "lambda_mse": 1.0,
+    "lambda_fr": 200.0,
+    "mask_rate": 0.5,
+    "step_size": 20,
+    "n_cycles": 30,
+    "n_rooms": 20,
+    "schedule_seed": 0,
+    "mask_rng_seed": 0,
+    "trajectory_duration_s": 600.0,
+    "record_n_segments": null,
+    "train_mode": "default",
+    "device": null
+  },
+  "run": {
+    "save_every_k_cycles": 3,
+    "checkpoint_every_k_rooms": 10,
+    "resume": true
+  }
+}
