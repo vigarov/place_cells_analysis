@@ -118,7 +118,6 @@ _sbatch_with_logs() {
 	local script_path="${1:?}"
 	shift
 	local stage="${1:-}"
-	local -a script_args=()
 	if [[ -n "${stage}" && "${stage}" != --* ]]; then
 		shift
 	else
@@ -128,16 +127,9 @@ _sbatch_with_logs() {
 	local -a sbatch_args=(--parsable --account="${SLURM_ACCOUNT}" --chdir="${PROJECT_ROOT}")
 	mapfile -d '' -t _log_array_args < <(_sbatch_log_and_array_args "${script_path}" "${stage}")
 	sbatch_args+=("${_log_array_args[@]}")
-	if (($#)); then
-		if [[ "$1" == "--" ]]; then
-			shift
-			script_args=("$@")
-		else
-			sbatch_args+=("$@")
-		fi
-	fi
+	local -a script_args=("$@")
 	if ((${#script_args[@]})); then
-		sbatch "${sbatch_args[@]}" "${script_path}" -- "${script_args[@]}"
+		sbatch "${sbatch_args[@]}" "${script_path}" "${script_args[@]}"
 	else
 		sbatch "${sbatch_args[@]}" "${script_path}"
 	fi

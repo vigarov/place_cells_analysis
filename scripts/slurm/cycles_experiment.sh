@@ -32,7 +32,7 @@ if [[ -z "${SLURM_JOB_ID:-}" && "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	# shellcheck source=common.sh
 	source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 	resolve_cycles_config "${1:-}"
-	_run_slurm_stage "${BASH_SOURCE[0]}" -- "${CYCLES_CONFIG}"
+	_run_slurm_stage "${BASH_SOURCE[0]}" "${CYCLES_CONFIG}"
 	exit $?
 fi
 
