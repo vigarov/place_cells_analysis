@@ -3,7 +3,7 @@ name = "place-cells-episodic-rnn"
 version = "0.1.0"
 description = "Recurrent autoencoder model of hippocampal place cells (Wang et al., NeurIPS 2024)"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
@@ -29,11 +29,24 @@ requires = ["setuptools >= 64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-package-dir = { "" = "src", "nn4n" = "src/models/nn4n" }
+packages = [
+    "analysis",
+    "core",
+    "cycles",
+    "trajectories",
+    "models",
+    "nn4n",
+    "nn4n.nn",
+    "scripts",
+]
 
-[tool.setuptools.packages.find]
-where = ["src", "src/models", "."]
-include = ["analysis*", "cycles*", "core*", "trajectories*", "scripts*", "models*", "nn4n*"]
+[tool.setuptools.package-dir]
+"" = "src"
+"nn4n" = "src/models/nn4n"
+"scripts" = "scripts"
+
+[tool.uv]
+package = true
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
