@@ -1717,7 +1717,7 @@ wheels = [
 ]
 
 [[package]]
-name = "place-cells-episodic-rnn"
+name = "place-cells-analysis"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
