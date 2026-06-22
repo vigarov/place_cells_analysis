@@ -3,9 +3,10 @@ ckpts/
 plots/
 results/
 
-# Uncommen on cluster
-# uv.lock
-# pyproject.toml
+# Also consider executing the following commands on cluster whne changing torch index
+# git update-index --skip-worktree uv.lock
+# git update-index --skip-worktree pyproject.toml
+# git update-index --skip-worktree network_analyzer.egg-info
 
 
 # Byte-compiled / optimized / DLL files
