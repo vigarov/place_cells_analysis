@@ -2,9 +2,10 @@
 """
 Run the Wang et al. (NeurIPS 2024) multi-room cycles experiment (training only).
 
-20 rooms x 30 cycles → 600 recorded rate-map trials. Saves checkpoints and
-`results/cycles/cycles_ratemaps.npz`. Use `src/cycles/notebook/cycles_experiment.ipynb`
-for Supplemental Figures 1 & 2.
+20 rooms x 30 cycles → 600 recorded rate-map trials. Saves checkpoints,
+`results/cycles/cycles_ratemaps.npz` (post-training), and
+`results/cycles/cycles_ratemaps_pre.npz` (pre-training). Use
+`src/cycles/notebook/cycles_experiment.ipynb` for Supplemental Figures 1 & 2.
 
 Prerequisites: generate rooms under `data/cycles/` with::
 
@@ -161,7 +162,9 @@ def main(argv: list[str] | None = None) -> None:
             checkpoint_every_k_rooms=args.checkpoint_every_k_rooms,
         )
 
-    print("Rate maps:", result.ratemaps.shape)
+    print("Post rate maps:", result.ratemaps.shape)
+    if result.ratemaps_pre is not None:
+        print("Pre rate maps:", result.ratemaps_pre.shape)
     print("Visits:", len(result.visit_indices))
 
 
