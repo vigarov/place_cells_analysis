@@ -8,11 +8,14 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "numpy>=2.4.6",
+    "openpyxl>=3.1.5",
     "pandas>=3.0.3",
     "plotly>=6.8.0",
+    "pot>=0.9.7",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
     "torch>=2.9.1",
+    "torch-shampoo>=1.0.0",
     "tqdm>=4.67.3",
 ]
 
@@ -71,3 +74,4 @@ torch = [
 torchvision = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
 ]
+torch-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }

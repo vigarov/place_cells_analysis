@@ -2,11 +2,13 @@ data/
 ckpts/
 plots/
 results/
+results_bak/
+local/
 
 # Also consider executing the following commands on cluster whne changing torch index
 # git update-index --skip-worktree uv.lock
 # git update-index --skip-worktree pyproject.toml
-# git update-index --skip-worktree place-cells-episodic-rnn.egg-info/
+# git update-index --skip-worktree src/place_cells_analysis.egg-info/*
 
 
 # Byte-compiled / optimized / DLL files

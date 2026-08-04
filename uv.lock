@@ -494,6 +494,15 @@ wheels = [
 ]
 
 [[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1557,6 +1566,18 @@ wheels = [
 ]
 
 [[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050", size = 186464, upload-time = "2024-06-28T14:03:44.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2", size = 250910, upload-time = "2024-06-28T14:03:41.161Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1724,12 +1745,15 @@ dependencies = [
     { name = "jupyter" },
     { name = "matplotlib" },
     { name = "numpy" },
+    { name = "openpyxl" },
     { name = "pandas" },
     { name = "plotly" },
+    { name = "pot" },
     { name = "scipy" },
     { name = "seaborn" },
     { name = "torch", version = "2.12.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torch", version = "2.12.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
+    { name = "torch-shampoo" },
     { name = "tqdm" },
 ]
 
@@ -1738,12 +1762,15 @@ requires-dist = [
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "numpy", specifier = ">=2.4.6" },
+    { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "plotly", specifier = ">=6.8.0" },
+    { name = "pot", specifier = ">=0.9.7" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.9.1" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.9.1", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torch-shampoo", git = "https://github.com/facebookresearch/optimizers.git" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 
@@ -1767,6 +1794,41 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/94/fd/d72c292d78aadb93d1a9bcd76bf3c678271040c7cf10abe5788b33040a39/plotly-6.8.0.tar.gz", hash = "sha256:e088e7ddc68d4f70e3d66659224727a45296d71d2b8284181862d3d8f1f0d88f", size = 6915161, upload-time = "2026-06-03T18:33:40.226Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f9/14/abe5ce876ab5b66ee3c691bf537fcd43d037aea55d447aacf74630a8f31e/plotly-6.8.0-py3-none-any.whl", hash = "sha256:13c5c4a0f70b74cab1913eda0de49b826df5931708eb6f9c3010040614700ec8", size = 9902055, upload-time = "2026-06-03T18:33:34.26Z" },
+]
+
+[[package]]
+name = "pot"
+version = "0.9.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/cf/61deefb2c9b300cd186321bc3126cf80c74262006f122dbbef1f6e5fb833/pot-0.9.7-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:9d2415e546a168fa8f1a7fa1b4d4a22d9855c8ad725b18d6879704c1df28e9f5", size = 1532457, upload-time = "2026-07-08T06:41:55.489Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/9d/37d5e6e51cdf3d67105766f58975a7f23081fdd02029fe46dd2afe17b068/pot-0.9.7-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:95e4e4815a6402df4bef510c456e900641d8d1402d2cdc672fd04da200658134", size = 983186, upload-time = "2026-07-08T06:41:57.085Z" },
+    { url = "https://files.pythonhosted.org/packages/85/2c/85b9a8096cf09a171a12752a21ffb154099252fe39ed4f726e247cd5faac/pot-0.9.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:6b1f830e1dcf1f2fc0a48dcf94d0c6ae0a65b56e6666d9dfda4f9c54ac51307e", size = 924595, upload-time = "2026-07-08T06:41:58.454Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/5b/cfbad726019d8d77eadd3631151128330332e4a73e805143ff418222e335/pot-0.9.7-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e670a032831c48f468cb302a3e3a20b2ff71fc7a22c9b738343355f73941a411", size = 32266406, upload-time = "2026-07-08T06:42:01.288Z" },
+    { url = "https://files.pythonhosted.org/packages/37/72/482e335fdeb99e51f88f1b6d99813599e64ba41fdbda90312865cd980bb8/pot-0.9.7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b94f3a1e7420a12b98d2303de3ffa2c2088ae7580ff623cb506ba328d88474a0", size = 32918287, upload-time = "2026-07-08T06:42:05.498Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/4d/1a3a659829368537bd61803e6b319abb55b7623dca37cac3237143f63c56/pot-0.9.7-cp312-cp312-win_amd64.whl", hash = "sha256:8d37a532f8bbb665cf1385e2a917ff56ef59d9b21b1bfe2e656b8c41e8cfa5b1", size = 802969, upload-time = "2026-07-08T06:42:14.937Z" },
+    { url = "https://files.pythonhosted.org/packages/04/bb/ab7b5278b44c80aa0cc110b6fe134d66d88c63d2690dcd6840d91c76e1e4/pot-0.9.7-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:6e4f783da69d379b37becf047e002ec43092c3875234bbef3023c050f84b0d57", size = 1529228, upload-time = "2026-07-08T06:37:16.577Z" },
+    { url = "https://files.pythonhosted.org/packages/29/a3/1647027a997a7910e414f7234b5bf5944e34b166b1f757e1e1d1927e5c80/pot-0.9.7-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:28f8d80aa05350e22bebeedd9cace7eb6a27cdb23f1f07f2afed96fdb5a0dbd6", size = 981820, upload-time = "2026-07-08T06:37:18.193Z" },
+    { url = "https://files.pythonhosted.org/packages/14/f6/109a66238f204d5c27955a1ca9be46352de9bbcaf8e9106405d4a58ca92b/pot-0.9.7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6c1b2471bca1ff284c8f5eecf9c7427dfa362baf0148f9ef55ee321d8905501d", size = 923024, upload-time = "2026-07-08T06:37:19.519Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/7f/d1ab9bb52765efcb2b62afeaa487bf7748327fc6865d634132c2482b911f/pot-0.9.7-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3997e1504a5818fb9f536c576bc4cb2ac9ddc662998c714e39ecbc1682af5e97", size = 32253703, upload-time = "2026-07-08T06:37:22.194Z" },
+    { url = "https://files.pythonhosted.org/packages/75/31/1e495c6140348604d0dcb85719842c267f77231af38cf1a80988ae521544/pot-0.9.7-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2e89da8a666e66e9356b480ac2a1a777f5f07db58a90f30f06c4cfffc409e7c5", size = 32907544, upload-time = "2026-07-08T06:37:25.944Z" },
+    { url = "https://files.pythonhosted.org/packages/57/1e/72bbe1c5245fb255ef1e1f5df077f745bea19779bbe4bb1f726807982766/pot-0.9.7-cp313-cp313-win_amd64.whl", hash = "sha256:602a24d9338c8fc6cce81d2d0bb1286bb59ea60701df931e4b782cd2ffb53568", size = 800159, upload-time = "2026-07-08T06:37:28.515Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/04/bbf251a112d72dbeacd0592fe0f354157caafecf0f631f6faf6928c5cdfb/pot-0.9.7-cp314-cp314-macosx_10_13_universal2.whl", hash = "sha256:d8d46869ed419b2dec9e459f38ac9687023dc57acba24afcf9d8248a00c60c5d", size = 1529844, upload-time = "2026-07-08T06:37:36.554Z" },
+    { url = "https://files.pythonhosted.org/packages/de/31/5054362d7da0d5738c3c658eac665487506b0c16e3bbbae8167691a7de20/pot-0.9.7-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:9f14113a9ed4d0a738d2286d97f1ea5afe3a7d3e034fd88a8ba89745ecd924ef", size = 981509, upload-time = "2026-07-08T06:37:38.079Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/2f/2707d925574f119a3d5e8f614392e2be7bc4a6b46e1ab4265ec336390a88/pot-0.9.7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:44ee2a3d9cf6c2be6c257fadd791729c5feb4b363e5034e345a2dc07f23f3203", size = 923819, upload-time = "2026-07-08T06:37:39.748Z" },
+    { url = "https://files.pythonhosted.org/packages/34/93/ff85caee000aa89858587c11d7fe4054778d62468886c228976c6b8bb8fc/pot-0.9.7-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:87c8d338dd2d79437f76d7fb70122784e1c49eedc1943eadb4c60626fabb03c9", size = 32250302, upload-time = "2026-07-08T06:37:42.356Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/82/e58bbeb95a2bb8cc4e14428ad47df0bf8d3bda12f517d79ac0e377b04a19/pot-0.9.7-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8efd208ef21e54ac55be388888494130f94b8beeb873fa06a55de45d256155be", size = 32891459, upload-time = "2026-07-08T06:37:46.02Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/46/06a631cc22b6fc70b51c4dc19d34d89da14738e5ae158cf475d88dbcfb36/pot-0.9.7-cp314-cp314-win_amd64.whl", hash = "sha256:3ec3b4a9ebe11d31382eb59da5cc92776395b49185ae046798880b0f21507430", size = 811912, upload-time = "2026-07-08T06:38:03.393Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/51/8337177cdfee9445b806b98d4117fbc3f2ca24df0cfc39724cbcb709cfa5/pot-0.9.7-cp314-cp314t-macosx_10_13_universal2.whl", hash = "sha256:bbc041f7ec402e3b47c27134b0caeb51c3fcd34135756501c73d2db87a2fb827", size = 1551150, upload-time = "2026-07-08T06:37:48.863Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/a7/d317e8978a46ad429751ec1174909e11a56cd4ecb83a12ae8011c6550523/pot-0.9.7-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:da32447ed30a5cc70220ddb9ff4023d82f135b8a2ae7acc69fc515541badc0dc", size = 990942, upload-time = "2026-07-08T06:37:50.172Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/60/9cdee794f00a14c6e3f187dd7b6b05068df44685b62091d70ea4d2befb1b/pot-0.9.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:17eff33fa2ec442bd03c485306f1643f7a6ac9aba621690937bd91962c4728e8", size = 935678, upload-time = "2026-07-08T06:37:51.701Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/f7/cb44c00af4b61ce8f16d8f819723be4cd91e721cda171f83a18789437f7a/pot-0.9.7-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0af88807ba41db6bc1d71fb7b2686d70882d72f7728c16a26380b4f87bf7a7b7", size = 32353585, upload-time = "2026-07-08T06:37:55.038Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/82/0b17d7cd263303694232fc9fae24457b6d4274fd95dc1855852a54dfce16/pot-0.9.7-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e6d046496f2956328c832e3a4937b2ec5e1fbfe2972fa9e88d5c9ac9948a2fe5", size = 32942062, upload-time = "2026-07-08T06:37:59.316Z" },
+    { url = "https://files.pythonhosted.org/packages/86/3c/0e071d3e45b5e51188f3bd044fd024ac358693615db7a7b9d4575f71af8f/pot-0.9.7-cp314-cp314t-win_amd64.whl", hash = "sha256:31e288d746f402a95735f27ffa064df5fa40630737f115922affd7845aa4a739", size = 822264, upload-time = "2026-07-08T06:38:01.794Z" },
 ]
 
 [[package]]
@@ -2394,6 +2456,15 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:c84c5988b3e416669ed3790d772479af5934d1788119288d8bddd9c4cb207285", upload-time = "2026-06-18T02:44:58Z" },
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:3d9cbeffed603075484270c34344e9506d86850af734d1e2eee13a8ba4bd690c", upload-time = "2026-06-18T02:47:40Z" },
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:0b4a8bdc9a89d1109bf4056d56e1c3ed05966273056d983a91f1cf597c25bea6", upload-time = "2026-06-18T02:48:07Z" },
+]
+
+[[package]]
+name = "torch-shampoo"
+version = "1.0.0"
+source = { git = "https://github.com/facebookresearch/optimizers.git#f18f735c972d304542af15e62b5acaa503169f2b" }
+dependencies = [
+    { name = "torch", version = "2.12.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "torch", version = "2.12.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
 
 [[package]]
