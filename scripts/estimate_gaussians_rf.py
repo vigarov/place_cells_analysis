@@ -4,15 +4,18 @@ Fit N-Gaussian receptive fields to cycles experiment rate maps.
 
 For each visit and hidden unit, fits a sum of -n_gaussians- independent 2D
 Gaussians (same routine as `analysis.sum_gaussians`).
-Writes -gaussian_rf_fits.npz- next to the input results file or truncated-dir.
-Each output includes -r2-, -gaussian_params-, -aic-, and per-rate-map
--signal_mean- / -signal_max- / -signal_std-.
+Writes `gaussian_rf_fits.npz` (post) and `gaussian_rf_fits_pre.npz` (pre) next to
+the input results file or truncated-dir. Each output includes `r2`, `indiv_r2`,
+`gaussian_params`, `aic`, and per-rate-map `signal_mean` / `signal_max` /
+`signal_std`.
 
 Usage::
 
     uv run estimate-gaussians-rf
 
-    uv run estimate-gaussians-rf --input results/cycles/cycles_ratemaps_truncated_10.npz
+    uv run estimate-gaussians-rf --input results/cycles
+
+    uv run estimate-gaussians-rf --input results/cycles/cycles_ratemaps_pre.npz
 
     uv run estimate-gaussians-rf --truncated-dir --input results/cycles
 
@@ -30,16 +33,21 @@ from tqdm.auto import tqdm
 from analysis.sum_gaussians import fit_sum_gaussians
 from analysis.sum_gaussians_core import (
     _aic_from_least_squares,
+    _gaussian_2d,
     _make_sum_gaussians_model,
 )
 from cycles.ratemaps_io import (
     DEFAULT_CYCLES_RESULTS_DIR,
     DEFAULT_CYCLES_RESULTS_NAME,
     DEFAULT_CYCLES_RESULTS_PATH,
+    DEFAULT_CYCLES_RESULTS_PRE_NAME,
+    discover_cycles_ratemaps_in_dir,
+    discover_truncated_pre_ratemaps_series,
     discover_truncated_ratemaps_series,
 )
 
 DEFAULT_OUTPUT_NAME = "gaussian_rf_fits.npz"
+DEFAULT_OUTPUT_PRE_NAME = "gaussian_rf_fits_pre.npz"
 DEFAULT_TOTAL_CYCLES = 30
 CPU_WORKER_RESERVE = 4
 CURVES_PER_WORKER_CHUNK = 1000
@@ -81,8 +89,31 @@ def _default_input_path() -> Path:
     return DEFAULT_CYCLES_RESULTS_PATH
 
 
-def _output_path(base: Path) -> Path:
-    return base / DEFAULT_OUTPUT_NAME
+def _fits_output_name_for_ratemaps(ratemaps_name: str) -> str:
+    """Map a rate-map NPZ filename to its Gaussian-fit output filename."""
+    if ratemaps_name == DEFAULT_CYCLES_RESULTS_PRE_NAME:
+        return DEFAULT_OUTPUT_PRE_NAME
+    if ratemaps_name == DEFAULT_CYCLES_RESULTS_NAME:
+        return DEFAULT_OUTPUT_NAME
+    if ratemaps_name.startswith("cycles_ratemaps_pre_truncated_"):
+        return DEFAULT_OUTPUT_PRE_NAME
+    if ratemaps_name.startswith("cycles_ratemaps_truncated_"):
+        return DEFAULT_OUTPUT_NAME
+    stem = ratemaps_name.removesuffix(".npz")
+    if stem.endswith("_pre"):
+        return f"gaussian_rf_fits_{stem.rsplit('_', 1)[-1]}.npz"
+    return f"gaussian_rf_fits_{stem}.npz"
+
+
+def _output_path(input_path: Path) -> Path:
+    """Gaussian-fit output path next to the input rate-map NPZ."""
+    return input_path.parent / _fits_output_name_for_ratemaps(input_path.name)
+
+
+def _output_path_for_dir(directory: Path, *, pre: bool = False) -> Path:
+    """Merged Gaussian-fit output for a results or truncated directory."""
+    name = DEFAULT_OUTPUT_PRE_NAME if pre else DEFAULT_OUTPUT_NAME
+    return Path(directory) / name
 
 
 def _partial_output_path(base: Path, part: int, n_parts: int) -> Path:
@@ -150,12 +181,12 @@ def _fit_curves_chunk_worker(
 ) -> tuple[
     int,
     int,
-    list[tuple[int, int, float, np.ndarray, float, float, float, float]],
+    list[tuple[int, int, float, np.ndarray, np.ndarray, float, float, float, float]],
 ]:
     """
     Fit up to -CURVES_PER_WORKER_CHUNK- (visit, cell) rate maps (module-level).
 
-    Returns -(flat_start, flat_end, [(visit, cell, r2, params, aic,
+    Returns -(flat_start, flat_end, [(visit, cell, r2, params, indiv_r2, aic,
     signal_mean, signal_max, signal_std), ...])-.
     """
     shm = shared_memory.SharedMemory(name=shm_name)
@@ -163,7 +194,7 @@ def _fit_curves_chunk_worker(
         ratemaps = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=shm.buf)
         n_cells = shape[1]
         results: list[
-            tuple[int, int, float, np.ndarray, float, float, float, float]
+            tuple[int, int, float, np.ndarray, np.ndarray, float, float, float, float]
         ] = []
         for flat_idx in range(flat_start, flat_end):
             visit_idx = flat_idx // n_cells
@@ -234,6 +265,33 @@ def _aic_from_saved_params(
     return _aic_from_least_squares(n_obs, ss_res, n_params)
 
 
+def _indiv_r2_from_params(field: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """Per-Gaussian R² with each component alone vs. finite pixels. Shape (n_gaussians,)."""
+    n_gaussians = params.shape[0]
+    out = np.full(n_gaussians, np.nan, dtype=np.float64)
+    if not np.all(np.isfinite(params)):
+        return out
+
+    mask = np.isfinite(field)
+    if not np.any(mask):
+        return out
+
+    h, w = field.shape
+    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    x_pts = xx[mask]
+    y_pts = yy[mask]
+    y_true = field[mask].astype(np.float64)
+    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
+    if ss_tot <= 0:
+        return out
+
+    for k in range(n_gaussians):
+        y_pred = _gaussian_2d(params[k], x_pts, y_pts)
+        ss_res = float(np.sum((y_true - y_pred) ** 2))
+        out[k] = 1.0 - ss_res / ss_tot
+    return out
+
+
 def _params_from_fit(fit: dict, n_gaussians: int) -> np.ndarray:
     """Shape -(n_gaussians, 5)-."""
     out = np.full((n_gaussians, 5), np.nan, dtype=np.float64)
@@ -253,13 +311,13 @@ def _fit_one_curve(
     *,
     n_gaussians: int,
     device: str,
-) -> tuple[float, np.ndarray, float, float, float, float]:
+) -> tuple[float, np.ndarray, np.ndarray, float, float, float, float]:
     """
     Fit one (visit, cell) rate map.
 
-    Returns -r2-, -params-, -aic-, -signal_mean-, -signal_max-,
-    -signal_std-. Failed fits leave -r2-, -params-, and -aic- as NaN
-    but still record signal stats when the field has finite pixels.
+    Returns -r2-, -params-, -indiv_r2-, -aic-, -signal_mean-, -signal_max-,
+    -signal_std-. Failed fits leave -r2-, -params-, -indiv_r2-, and -aic- as
+    NaN but still record signal stats when the field has finite pixels.
     """
     signal_mean, signal_max, signal_std = _signal_stats(field)
     fit = _safe_fit_sum_gaussians(field, n_gaussians=n_gaussians, device=device)
@@ -267,6 +325,7 @@ def _fit_one_curve(
         return (
             np.nan,
             np.full((n_gaussians, 5), np.nan, dtype=np.float64),
+            np.full(n_gaussians, np.nan, dtype=np.float64),
             np.nan,
             signal_mean,
             signal_max,
@@ -275,12 +334,13 @@ def _fit_one_curve(
 
     params = _params_from_fit(fit, n_gaussians)
     r2 = float(fit["r2"])
+    indiv_r2 = _indiv_r2_from_params(field, params)
     aic_val = fit.get("aic")
     if aic_val is None or not np.isfinite(aic_val):
         aic = _aic_from_saved_params(field, params, n_gaussians=n_gaussians)
     else:
         aic = float(aic_val)
-    return r2, params, aic, signal_mean, signal_max, signal_std
+    return r2, params, indiv_r2, aic, signal_mean, signal_max, signal_std
 
 
 def _fit_ratemaps_serial(
@@ -290,7 +350,15 @@ def _fit_ratemaps_serial(
     device: str,
     show_progress: bool,
     desc: str | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     n_visits, n_cells, _, _ = ratemaps.shape
     r2 = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     gaussian_params = np.full(
@@ -298,6 +366,7 @@ def _fit_ratemaps_serial(
         np.nan,
         dtype=np.float64,
     )
+    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
     aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
@@ -315,6 +384,7 @@ def _fit_ratemaps_serial(
                 (
                     r2[visit_idx, cell_idx],
                     gaussian_params[visit_idx, cell_idx],
+                    indiv_r2[visit_idx, cell_idx],
                     aic[visit_idx, cell_idx],
                     signal_mean[visit_idx, cell_idx],
                     signal_max[visit_idx, cell_idx],
@@ -328,7 +398,7 @@ def _fit_ratemaps_serial(
     finally:
         progress.close()
 
-    return r2, gaussian_params, aic, signal_mean, signal_max, signal_std
+    return r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std
 
 
 def _fit_ratemaps_parallel(
@@ -338,7 +408,15 @@ def _fit_ratemaps_parallel(
     n_processes: int,
     show_progress: bool,
     desc: str | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     n_visits, n_cells, _, _ = ratemaps.shape
     r2 = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     gaussian_params = np.full(
@@ -346,6 +424,7 @@ def _fit_ratemaps_parallel(
         np.nan,
         dtype=np.float64,
     )
+    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
     aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
@@ -394,6 +473,7 @@ def _fit_ratemaps_parallel(
                         cell_idx,
                         r2_val,
                         params,
+                        indiv_r2_val,
                         aic_val,
                         mean_val,
                         max_val,
@@ -401,6 +481,7 @@ def _fit_ratemaps_parallel(
                     ) in chunk_results:
                         r2[visit_idx, cell_idx] = r2_val
                         gaussian_params[visit_idx, cell_idx] = params
+                        indiv_r2[visit_idx, cell_idx] = indiv_r2_val
                         aic[visit_idx, cell_idx] = aic_val
                         signal_mean[visit_idx, cell_idx] = mean_val
                         signal_max[visit_idx, cell_idx] = max_val
@@ -412,7 +493,7 @@ def _fit_ratemaps_parallel(
         shm.close()
         shm.unlink()
 
-    return r2, gaussian_params, aic, signal_mean, signal_max, signal_std
+    return r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std
 
 
 def fit_ratemaps(
@@ -423,7 +504,15 @@ def fit_ratemaps(
     n_processes: int = 1,
     show_progress: bool = True,
     desc: str | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
     Fit Gaussians for each (visit, cell).
 
@@ -436,6 +525,8 @@ def fit_ratemaps(
         -(n_visits, n_cells)-
     gaussian_params
         -(n_visits, n_cells, n_gaussians, 5)-
+    indiv_r2
+        Per-Gaussian R², -(n_visits, n_cells, n_gaussians)-
     aic
         -(n_visits, n_cells)-
     signal_mean, signal_max, signal_std
@@ -463,6 +554,7 @@ def _save_fits(
     *,
     r2: np.ndarray,
     gaussian_params: np.ndarray,
+    indiv_r2: np.ndarray,
     aic: np.ndarray,
     signal_mean: np.ndarray,
     signal_max: np.ndarray,
@@ -477,6 +569,7 @@ def _save_fits(
     payload: dict[str, np.ndarray | int | str] = {
         "r2": r2,
         "gaussian_params": gaussian_params,
+        "indiv_r2": indiv_r2,
         "aic": aic,
         "signal_mean": signal_mean,
         "signal_max": signal_max,
@@ -510,6 +603,7 @@ def _merge_partial_files(
         np.nan,
         dtype=np.float64,
     )
+    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
     aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
     signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
@@ -523,6 +617,8 @@ def _merge_partial_files(
             end = int(part["visit_end"])
             r2[start:end] = part["r2"]
             gaussian_params[start:end] = part["gaussian_params"]
+            if "indiv_r2" in part:
+                indiv_r2[start:end] = part["indiv_r2"]
             aic[start:end] = part["aic"]
             signal_mean[start:end] = part["signal_mean"]
             signal_max[start:end] = part["signal_max"]
@@ -547,6 +643,7 @@ def _merge_partial_files(
         output_path,
         r2=r2,
         gaussian_params=gaussian_params,
+        indiv_r2=indiv_r2,
         aic=aic,
         signal_mean=signal_mean,
         signal_max=signal_max,
@@ -580,11 +677,11 @@ def run_estimate_single_file(
         raise FileNotFoundError(input_path)
 
     n_visits, n_cells, _, _ = _read_ratemap_shape(input_path)
-    output_path = _output_path(input_path.parent)
+    output_path = _output_path(input_path)
 
     if memory_split <= 1:
         ratemaps = _load_ratemaps_file(input_path)
-        r2, gaussian_params, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
+        r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
             device=device,
@@ -597,6 +694,7 @@ def run_estimate_single_file(
             output_path,
             r2=r2,
             gaussian_params=gaussian_params,
+            indiv_r2=indiv_r2,
             aic=aic,
             signal_mean=signal_mean,
             signal_max=signal_max,
@@ -617,7 +715,7 @@ def run_estimate_single_file(
             continue
         with np.load(input_path) as data:
             ratemaps = np.asarray(data["ratemaps"][visit_start:visit_end])
-        r2, gaussian_params, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
+        r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
             device=device,
@@ -638,6 +736,7 @@ def run_estimate_single_file(
             partial_path,
             r2=r2,
             gaussian_params=gaussian_params,
+            indiv_r2=indiv_r2,
             aic=aic,
             signal_mean=signal_mean,
             signal_max=signal_max,
@@ -650,7 +749,7 @@ def run_estimate_single_file(
             room_ids=room_ids,
         )
         partial_paths.append(partial_path)
-        del r2, gaussian_params, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
+        del r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
 
     _merge_partial_files(
         partial_paths,
@@ -676,24 +775,22 @@ def _print_truncated_segments(
         print(f"  [{start_cycle}, {end_cycle}): {path}")
 
 
-def run_estimate_truncated_dir(
-    truncated_dir: Path,
+def _run_estimate_truncated_series(
+    segments: list[tuple[int, int, Path]],
     *,
-    total_cycles: int = DEFAULT_TOTAL_CYCLES,
-    n_gaussians: int = 2,
-    device: str = "cpu",
-    n_processes: int = 1,
-    show_progress: bool = True,
+    output_path: Path,
+    source_path: Path,
+    total_cycles: int,
+    n_gaussians: int,
+    device: str,
+    n_processes: int,
+    show_progress: bool,
 ) -> Path:
-    truncated_dir = Path(truncated_dir)
-    segments = discover_truncated_ratemaps_series(
-        truncated_dir, total_cycles=total_cycles
-    )
+    """Fit Gaussians across contiguous truncated rate-map segments."""
     _print_truncated_segments(segments, total_cycles=total_cycles)
     n_rooms = _n_rooms_from_truncated_file(segments[0][2])
     n_visits = total_cycles * n_rooms
     _, n_cells, _, _ = _read_ratemap_shape(segments[0][2])
-    output_path = _output_path(truncated_dir)
 
     partial_paths: list[Path] = []
     n_parts = len(segments)
@@ -707,7 +804,7 @@ def run_estimate_truncated_dir(
                 f"got {ratemaps.shape[0]}"
             )
 
-        r2, gaussian_params, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
+        r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
             device=device,
@@ -721,11 +818,12 @@ def run_estimate_truncated_dir(
         del ratemaps
 
         cycle_ids, room_ids = _load_metadata_arrays(segment_path)
-        partial_path = _partial_output_path(truncated_dir, part_idx, n_parts)
+        partial_path = _partial_output_path(output_path.parent, part_idx, n_parts)
         _save_fits(
             partial_path,
             r2=r2,
             gaussian_params=gaussian_params,
+            indiv_r2=indiv_r2,
             aic=aic,
             signal_mean=signal_mean,
             signal_max=signal_max,
@@ -738,7 +836,7 @@ def run_estimate_truncated_dir(
             room_ids=room_ids,
         )
         partial_paths.append(partial_path)
-        del r2, gaussian_params, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
+        del r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
 
     _merge_partial_files(
         partial_paths,
@@ -746,12 +844,90 @@ def run_estimate_truncated_dir(
         n_cells=n_cells,
         n_gaussians=n_gaussians,
         output_path=output_path,
-        source_path=truncated_dir,
+        source_path=source_path,
     )
     for partial_path in partial_paths:
         partial_path.unlink(missing_ok=True)
 
     return output_path
+
+
+def run_estimate_truncated_dir(
+    truncated_dir: Path,
+    *,
+    total_cycles: int = DEFAULT_TOTAL_CYCLES,
+    n_gaussians: int = 2,
+    device: str = "cpu",
+    n_processes: int = 1,
+    show_progress: bool = True,
+) -> list[Path]:
+    truncated_dir = Path(truncated_dir)
+    outputs: list[Path] = []
+
+    post_segments = discover_truncated_ratemaps_series(
+        truncated_dir, total_cycles=total_cycles
+    )
+    outputs.append(
+        _run_estimate_truncated_series(
+            post_segments,
+            output_path=_output_path_for_dir(truncated_dir, pre=False),
+            source_path=truncated_dir,
+            total_cycles=total_cycles,
+            n_gaussians=n_gaussians,
+            device=device,
+            n_processes=n_processes,
+            show_progress=show_progress,
+        )
+    )
+
+    try:
+        pre_segments = discover_truncated_pre_ratemaps_series(
+            truncated_dir, total_cycles=total_cycles
+        )
+    except FileNotFoundError:
+        pre_segments = None
+
+    if pre_segments is not None:
+        outputs.append(
+            _run_estimate_truncated_series(
+                pre_segments,
+                output_path=_output_path_for_dir(truncated_dir, pre=True),
+                source_path=truncated_dir,
+                total_cycles=total_cycles,
+                n_gaussians=n_gaussians,
+                device=device,
+                n_processes=n_processes,
+                show_progress=show_progress,
+            )
+        )
+
+    return outputs
+
+
+def run_estimate_results_dir(
+    results_dir: Path,
+    *,
+    n_gaussians: int = 2,
+    memory_split: int = 1,
+    device: str = "cpu",
+    n_processes: int = 1,
+    show_progress: bool = True,
+) -> list[Path]:
+    """Fit Gaussians for each rate-map NPZ discovered under `results_dir`."""
+    ratemap_paths = discover_cycles_ratemaps_in_dir(results_dir)
+    outputs: list[Path] = []
+    for ratemap_path in ratemap_paths:
+        outputs.append(
+            run_estimate_single_file(
+                ratemap_path,
+                n_gaussians=n_gaussians,
+                memory_split=memory_split,
+                device=device,
+                n_processes=n_processes,
+                show_progress=show_progress,
+            )
+        )
+    return outputs
 
 
 def run_estimate(
@@ -764,7 +940,7 @@ def run_estimate(
     device: str = "cpu",
     n_processes: int | str = "auto",
     show_progress: bool = True,
-) -> Path:
+) -> Path | list[Path]:
     input_path = Path(input_path)
     workers = resolve_n_processes(n_processes, device=device)
     if truncated_dir:
@@ -781,6 +957,15 @@ def run_estimate(
             input_path,
             total_cycles=total_cycles,
             n_gaussians=n_gaussians,
+            device=device,
+            n_processes=workers,
+            show_progress=show_progress,
+        )
+    if input_path.is_dir():
+        return run_estimate_results_dir(
+            input_path,
+            n_gaussians=n_gaussians,
+            memory_split=memory_split,
             device=device,
             n_processes=workers,
             show_progress=show_progress,
@@ -815,7 +1000,8 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         default=None,
         help=(
-            f"Cycles results NPZ, or directory of truncated NPZs with --truncated-dir "
+            f"Cycles results NPZ, results directory (fits post and pre rate maps "
+            f"when both exist), or directory of truncated NPZs with --truncated-dir "
             f"(default file: results/{DEFAULT_CYCLES_RESULTS_NAME})."
         ),
     )
@@ -904,7 +1090,11 @@ def main(argv: list[str] | None = None) -> None:
         n_processes=args.n_processes,
         show_progress=not args.quiet,
     )
-    print(f"Wrote {out}")
+    if isinstance(out, list):
+        for path in out:
+            print(f"Wrote {path}")
+    else:
+        print(f"Wrote {out}")
 
 
 if __name__ == "__main__":
