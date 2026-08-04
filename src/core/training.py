@@ -34,6 +34,7 @@ class _TrainParams(Protocol):
     lambda_fr: float
     train_mode: TrainMode
     n_segments: int | None
+    gradient_clip_max: float | None
 
 
 @dataclass
@@ -47,6 +48,7 @@ class TrainConfig:
     learning_rate: float = 5e-4
     train_mode: TrainMode = "default"
     n_segments: int | None = None
+    gradient_clip_max: float | None = None
 
 
 def rebatch_trajectories(
@@ -124,6 +126,8 @@ def train_steps(
             + fr_loss(states[0]) * config.lambda_fr
         )
         loss.backward()
+        if config.gradient_clip_max is not None:
+            torch.nn.utils.clip_grad_norm_(rae.parameters(), config.gradient_clip_max)
         optimizer.step()
 
 
