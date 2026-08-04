@@ -1,6 +1,6 @@
 """Train RAE across multi-room cycles and record rate maps (600 trials)."""
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 from cycles.cycles_paths import RESULTS_DIR, ROOMS_DIR, resolve_cycles_paths
 from cycles.constants import STEP_SIZE
 from core.utils import compute_ratemap
-from models.utils import build_rae
+from models.utils import RaeModelConfig, build_rae, rae_model_config_from_dict
 from core.training import (
     TrainMode,
     rebatch_trajectories,
@@ -28,6 +28,7 @@ from cycles.cycles_data import (
 )
 from cycles.ratemaps_io import (
     DEFAULT_CYCLES_RESULTS_NAME,
+    DEFAULT_CYCLES_RESULTS_PRE_NAME,
     TRUNCATED_RATEMAPS_PREFIX,
     TRUNCATED_RATEMAPS_SUFFIX,
     discover_truncated_ratemaps_series,
@@ -68,6 +69,10 @@ class CyclesConfig:
     train_mode: TrainMode = "default"
 
     device: str | None = None  # resolved in run_cycles_experiment
+
+    gradient_clip_max: float | None = None
+
+    model: RaeModelConfig = field(default_factory=RaeModelConfig)
 
     def resolve_device(self) -> torch.device:
         if self.device is not None:
@@ -114,6 +119,8 @@ def load_cycles_experiment_config(path: Path | str) -> CyclesExperimentRunConfig
         raise ValueError(f"Config 'run' section must be a JSON object: {path}")
 
     cycles = cycles_config_from_dict(cycles_raw)
+    model = rae_model_config_from_dict(payload.get("model", {}))
+    cycles = replace(cycles, model=model)
     run_kwargs = {k: run_raw[k] for k in _RUN_CONFIG_FIELDS if k in run_raw}
     return CyclesExperimentRunConfig(cycles=cycles, **run_kwargs)
 
@@ -146,12 +153,126 @@ def resolve_record_n_segments(
     *,
     traj_timesteps: int,
 ) -> int:
+    """
+    Episodic steps to aggregate when recording rate maps.
+
+    `traj_timesteps` must match the time axis of the tensor passed to
+    `compute_ratemap` (per-row length after rebatching), not the raw visit
+    length from `trajectory_duration_s`.
+    """
+    max_steps = traj_timesteps // config.step_size
     if config.record_n_segments is not None:
-        return config.record_n_segments
-    if config.trajectory_duration_s is not None:
-        n_steps = trial_steps_from_duration(config.trajectory_duration_s)
-        return n_steps // config.step_size
-    return traj_timesteps // config.step_size
+        return min(config.record_n_segments, max_steps)
+    return max_steps
+
+
+def _record_visit_ratemap(
+    rae,
+    traj_for_ratemap,
+    wsm,
+    arena_map,
+    device,
+    config: CyclesConfig,
+    *,
+    record_segments: int,
+    mask_generator: torch.Generator,
+) -> np.ndarray:
+    """Compute and return a single visit rate map (float32)."""
+    rae.eval()
+    rm = compute_ratemap(
+        rae,
+        traj_for_ratemap,
+        wsm,
+        arena_map,
+        device,
+        config.mask_rate,
+        config.step_size,
+        n_test=record_segments,
+        mask_generator=mask_generator,
+        show_progress=False,
+    )
+    return np.asarray(rm, dtype=np.float32)
+
+
+def _load_ratemaps_prefix_from_partial(
+    path: Path,
+    ratemaps: np.ndarray,
+    start_visit: int,
+) -> None:
+    """Copy saved rate maps from a partial NPZ into `ratemaps[:start_visit]`."""
+    with np.load(path) as data:
+        n_completed = int(data["n_completed"])
+        if n_completed != start_visit:
+            raise ValueError(
+                f"{path.name}: n_completed={n_completed} != expected start_visit={start_visit}"
+            )
+        saved = data["ratemaps"]
+        if saved.shape[0] != n_completed:
+            raise ValueError(
+                f"{path.name}: ratemaps length {saved.shape[0]} != n_completed={n_completed}"
+            )
+        np.copyto(ratemaps[:start_visit], saved)
+
+
+def _save_partial_pair(
+    post_path: Path,
+    pre_path: Path,
+    *,
+    ratemaps: np.ndarray,
+    ratemaps_pre: np.ndarray,
+    cycle_ids: np.ndarray,
+    room_ids: np.ndarray,
+    visit_indices: np.ndarray,
+    schedule: np.ndarray,
+    n_completed: int,
+    cycles_since_last_save: int = 0,
+    train_mode: TrainMode = "default",
+) -> None:
+    """Write post and pre partial rate-map NPZs with identical metadata."""
+    meta = dict(
+        cycle_ids=cycle_ids,
+        room_ids=room_ids,
+        visit_indices=visit_indices,
+        schedule=schedule,
+        n_completed=n_completed,
+        cycles_since_last_save=cycles_since_last_save,
+        train_mode=train_mode,
+    )
+    _save_partial_results(post_path, ratemaps=ratemaps, **meta)
+    _save_partial_results(pre_path, ratemaps=ratemaps_pre, **meta)
+
+
+def _save_final_ratemaps_pair(
+    results_dir: Path,
+    *,
+    ratemaps: np.ndarray,
+    ratemaps_pre: np.ndarray,
+    cycle_ids: np.ndarray,
+    room_ids: np.ndarray,
+    visit_indices: np.ndarray,
+    schedule: np.ndarray,
+    config: CyclesConfig,
+) -> None:
+    """Write final post and pre rate-map NPZs."""
+    payload = dict(
+        cycle_ids=cycle_ids,
+        room_ids=room_ids,
+        visit_indices=visit_indices,
+        schedule=schedule,
+        n_hidden=config.n_hidden,
+        n_wsm_cells=config.n_wsm_cells,
+        train_mode=config.train_mode,
+    )
+    np.savez_compressed(
+        results_dir / DEFAULT_CYCLES_RESULTS_NAME,
+        ratemaps=ratemaps,
+        **payload,
+    )
+    np.savez_compressed(
+        results_dir / DEFAULT_CYCLES_RESULTS_PRE_NAME,
+        ratemaps=ratemaps_pre,
+        **payload,
+    )
 
 
 @dataclass
@@ -164,6 +285,7 @@ class CyclesResult:
     visit_indices: np.ndarray
     schedule: np.ndarray
     config: CyclesConfig
+    ratemaps_pre: np.ndarray | None = None  # (n_visits, n_hidden, H, W)
 
 
 IndivComponent = Literal["model", "optim", "rng"]
@@ -483,7 +605,8 @@ def run_cycles_experiment(
     """
     Run the full cycles protocol: train in each shuffled room visit, record after each.
 
-    Saves `results/cycles/<suffix>/cycles_ratemaps.npz`, periodic training
+    Saves `results/cycles/<suffix>/cycles_ratemaps.npz` (post-training) and
+    `cycles_ratemaps_pre.npz` (pre-training), periodic training snapshots under
     snapshots under
     `ckpts/cycles/<suffix>/indiv/c<C>/r<R>_ridx<I>_{model,optim,rng}.pth` every
     `checkpoint_every_k_rooms` rooms within a cycle (requires
@@ -530,16 +653,23 @@ def run_cycles_experiment(
         dt=manifest.dt_s,
     )
     traj0_rebatched = rebatch_trajectories(traj0, n_segments=n_seg)
-    rae = build_rae(config.n_wsm_cells, config.n_hidden, device)
+    rae = build_rae(
+        config.n_wsm_cells,
+        config.n_hidden,
+        device,
+        model=config.model,
+    )
     optimizer = torch.optim.Adam(rae.parameters(), lr=config.learning_rate)
     mask_generator = torch.Generator(device="cpu")
     mask_generator.manual_seed(config.mask_rng_seed)
 
     indiv_dir = ckpt_dir / "indiv"
     room_maps_path = ckpt_dir / "room_maps.json"
-    partial_path = results_dir / "cycles_ratemaps.npz"
+    partial_path = results_dir / DEFAULT_CYCLES_RESULTS_NAME
+    partial_pre_path = results_dir / DEFAULT_CYCLES_RESULTS_PRE_NAME
     start_visit = 0
     ratemaps = None
+    ratemaps_pre = None
     cycles_since_last_save = 0
     need_align_save = False
 
@@ -610,6 +740,17 @@ def run_cycles_experiment(
 
     if ratemaps is None:
         ratemaps = np.zeros((n_visits, config.n_hidden, *arena0.shape), dtype=np.float32)
+    if ratemaps_pre is None:
+        ratemaps_pre = np.full(
+            (n_visits, config.n_hidden, *arena0.shape), np.nan, dtype=np.float32
+        )
+    if start_visit > 0 and partial_pre_path.is_file():
+        _load_ratemaps_prefix_from_partial(partial_pre_path, ratemaps_pre, start_visit)
+    elif start_visit > 0 and show_progress:
+        tqdm.write(
+            f"No {DEFAULT_CYCLES_RESULTS_PRE_NAME} found; pre rate maps before visit "
+            f"{start_visit} will remain NaN."
+        )
 
     record_segments = resolve_record_n_segments(
         config,
@@ -630,25 +771,32 @@ def run_cycles_experiment(
             dt=manifest.dt_s,
         )
 
-        train_room_visit(
-            rae, optimizer, traj_coord, wsm, device, config, mask_generator
-        )
-
         traj_for_ratemap = rebatch_trajectories(traj_coord, n_segments=n_seg)
-        rae.eval()
-        rm = compute_ratemap(
+        ratemaps_pre[v] = _record_visit_ratemap(
             rae,
             traj_for_ratemap,
             wsm,
             arena_map,
             device,
-            config.mask_rate,
-            config.step_size,
-            n_test=record_segments,
+            config,
+            record_segments=record_segments,
             mask_generator=mask_generator,
-            show_progress=False,
         )
-        ratemaps[v] = np.asarray(rm, dtype=np.float32)
+
+        train_room_visit(
+            rae, optimizer, traj_coord, wsm, device, config, mask_generator
+        )
+
+        ratemaps[v] = _record_visit_ratemap(
+            rae,
+            traj_for_ratemap,
+            wsm,
+            arena_map,
+            device,
+            config,
+            record_segments=record_segments,
+            mask_generator=mask_generator,
+        )
 
         if should_save_indiv_checkpoint(v, config.n_rooms, checkpoint_every_k_rooms):
             ref = indiv_checkpoint_ref_after_visit(v, rid, cyc, config.n_rooms)
@@ -668,9 +816,11 @@ def run_cycles_experiment(
         )
         if _visit_ends_cycle(v, cycle_ids, n_visits):
             if need_align_save:
-                _save_partial_results(
+                _save_partial_pair(
                     partial_path,
+                    partial_pre_path,
                     ratemaps=ratemaps,
+                    ratemaps_pre=ratemaps_pre,
                     cycle_ids=cycle_ids,
                     room_ids=room_ids,
                     visit_indices=visit_indices,
@@ -686,9 +836,11 @@ def run_cycles_experiment(
             else:
                 cycles_since_last_save += 1
                 if cycles_since_last_save >= save_every_k_cycles:
-                    _save_partial_results(
+                    _save_partial_pair(
                         partial_path,
+                        partial_pre_path,
                         ratemaps=ratemaps,
+                        ratemaps_pre=ratemaps_pre,
                         cycle_ids=cycle_ids,
                         room_ids=room_ids,
                         visit_indices=visit_indices,
@@ -701,16 +853,15 @@ def run_cycles_experiment(
                     if show_progress:
                         tqdm.write(f"Saved partial results after cycle {int(cycle_ids[v])}")
 
-    np.savez_compressed(
-        results_dir / "cycles_ratemaps.npz",
+    _save_final_ratemaps_pair(
+        results_dir,
         ratemaps=ratemaps,
+        ratemaps_pre=ratemaps_pre,
         cycle_ids=cycle_ids,
         room_ids=room_ids,
         visit_indices=visit_indices,
         schedule=schedule,
-        n_hidden=config.n_hidden,
-        n_wsm_cells=config.n_wsm_cells,
-        train_mode=config.train_mode,
+        config=config,
     )
 
     return CyclesResult(
@@ -720,6 +871,7 @@ def run_cycles_experiment(
         visit_indices=visit_indices,
         schedule=schedule,
         config=config,
+        ratemaps_pre=ratemaps_pre,
     )
 
 
@@ -729,12 +881,17 @@ def truncate_cycles_results(
     start_cycle: int = 0,
     input_path: Path | None = None,
     output_path: Path | None = None,
+    input_pre_path: Path | None = None,
+    output_pre_path: Path | None = None,
 ) -> Path:
     """
     Write a smaller NPZ keeping visits for cycles `start_cycle .. end_cycle-1`.
 
     Default input: `results/cycles_ratemaps.npz`. Default output: same directory as
     input, `truncated_cycles_results_path(end_cycle, start_cycle)`.
+
+    When a sibling `cycles_ratemaps_pre.npz` exists (or `input_pre_path` is set),
+    also writes the matching truncated pre file.
     """
     if end_cycle < 1:
         raise ValueError(f"end_cycle must be >= 1, got {end_cycle}")
@@ -756,6 +913,41 @@ def truncate_cycles_results(
     else:
         output_path = Path(output_path)
 
+    if input_pre_path is None:
+        sibling_pre = input_path.parent / DEFAULT_CYCLES_RESULTS_PRE_NAME
+        input_pre_path = sibling_pre if sibling_pre.is_file() else None
+    elif not Path(input_pre_path).is_file():
+        raise FileNotFoundError(input_pre_path)
+
+    if output_pre_path is None and input_pre_path is not None:
+        output_pre_path = truncated_cycles_results_path(
+            end_cycle, start_cycle, results_dir=input_path.parent, pre=True
+        )
+
+    output_path = _truncate_ratemaps_file(
+        input_path,
+        output_path,
+        start_cycle=start_cycle,
+        end_cycle=end_cycle,
+    )
+    if input_pre_path is not None and output_pre_path is not None:
+        _truncate_ratemaps_file(
+            input_pre_path,
+            output_pre_path,
+            start_cycle=start_cycle,
+            end_cycle=end_cycle,
+        )
+    return output_path
+
+
+def _truncate_ratemaps_file(
+    input_path: Path,
+    output_path: Path,
+    *,
+    start_cycle: int,
+    end_cycle: int,
+) -> Path:
+    """Slice visits for `[start_cycle, end_cycle)` from `input_path` into `output_path`."""
     with np.load(input_path) as data:
         schedule = np.asarray(data["schedule"])
         file_n_cycles, n_rooms = schedule.shape
@@ -835,6 +1027,12 @@ def load_cycles_result(
             config_kw["train_mode"] = str(np.asarray(data["train_mode"]))
         config = CyclesConfig(**config_kw)
 
+    ratemaps_pre = None
+    pre_path = npz_path.parent / DEFAULT_CYCLES_RESULTS_PRE_NAME
+    if pre_path.is_file() and npz_path.name == DEFAULT_CYCLES_RESULTS_NAME:
+        with np.load(pre_path) as pre_data:
+            ratemaps_pre = np.asarray(pre_data["ratemaps"])
+
     return CyclesResult(
         ratemaps=ratemaps,
         cycle_ids=cycle_ids,
@@ -842,4 +1040,5 @@ def load_cycles_result(
         visit_indices=visit_indices,
         schedule=schedule,
         config=config,
+        ratemaps_pre=ratemaps_pre,
     )

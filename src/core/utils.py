@@ -76,6 +76,11 @@ class RatemapAggregator:
             dtype=torch.float32,
             device=self.device
         )
+        self.finite_counts = torch.zeros(
+            (self.n_cells, *self.dims),
+            dtype=torch.float32,
+            device=self.device
+        )
         # shape: (n_x, n_y)
         self.visit_counts = torch.zeros(
             self.dims,
@@ -122,16 +127,22 @@ class RatemapAggregator:
 
         # Flatten partial sums and visit_counts for fast index_add
         flat_sums = self.partial_sums.view(self.n_cells, -1)  # shape: (n_cells, n_x*n_y)
+        flat_finite = self.finite_counts.view(self.n_cells, -1)
         flat_counts = self.visit_counts.view(-1)              # shape: (n_x*n_y)
 
         # Convert (row, col) coords into linear indices
         dims = self.dims
         flat_coords = coords[:, 0] * dims[1] + coords[:, 1]  # shape: (n_samples,)
 
+        # Ignore non-finite states (NaN + inf) so one bad sample cannot poison a bin.
+        finite = torch.isfinite(states)
+        safe_states = torch.where(finite, states, torch.zeros_like(states))
+
         # Accumulate partial sums
         # states.T shape: (n_cells, n_samples)
         # so we add states.T to the flat_sums at the flattened coordinate indices
-        flat_sums.index_add_(1, flat_coords, states.T)
+        flat_sums.index_add_(1, flat_coords, safe_states.T)
+        flat_finite.index_add_(1, flat_coords, finite.T.float())
 
         # Accumulate visit counts
         flat_counts.index_add_(
@@ -145,15 +156,11 @@ class RatemapAggregator:
         Returns the final normalized firing fields (n_cells, n_x, n_y).
         Unvisited points (visit_count=0) will be NaN.
         """
-        # Avoid division by zero by clamping
-        denom = self.visit_counts.clamp(min=1.0)  # shape: (n_x, n_y)
-        
-        # Broadcasting: partial_sums shape (n_cells, n_x, n_y) / (n_x, n_y)
-        ratemap = self.partial_sums / denom.unsqueeze(0)
+        denom = self.finite_counts.clamp(min=1.0)
+        ratemap = self.partial_sums / denom
 
-        # Set unvisited areas to NaN
-        mask_unvisited = (self.visit_counts == 0)
-        ratemap[:, mask_unvisited] = float('nan')
+        # Bins with no finite samples for a unit are NaN.
+        ratemap[self.finite_counts == 0] = float('nan')
 
         return ratemap
 
@@ -162,6 +169,7 @@ class RatemapAggregator:
         Reset the aggregator (clears all partial sums and counts).
         """
         self.partial_sums.zero_()
+        self.finite_counts.zero_()
         self.visit_counts.zero_()
 
 
@@ -203,16 +211,21 @@ def compute_ratemap(
 ):
     """Aggregate RAE hidden-state rate maps over trajectory segments."""
     rm_agg = RatemapAggregator(arena_map=arena_map, device=device)
+    max_steps = traj_coord.shape[1] // step_size
     if n_test is None:
-        n_test = min(500, traj_coord.shape[1] // step_size)
+        n_test = min(500, max_steps)
+    else:
+        n_test = min(n_test, max_steps)
     steps = range(n_test)
     if show_progress:
         steps = tqdm(steps, desc="Rate map", leave=False)
     with torch.no_grad():
+        init_states = None
         for step in steps:
             tc = traj_coord[:, step * step_size : (step + 1) * step_size]
             gt_res = torch.as_tensor(wsm.get_response(tc), dtype=torch.float32).to(device)
             masked_res = masking(gt_res[:, :-1], mask_rate, generator=mask_generator)
-            _, states = rae(masked_res)
+            _, states = rae(masked_res, init_states=init_states)
+            init_states = [states[0][:, -1, :].clone()]
             rm_agg.update(coords=tc[:, 1:], states=states[0])
     return rm_agg.get_ratemap().cpu().numpy()
