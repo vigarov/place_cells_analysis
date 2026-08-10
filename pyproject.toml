@@ -5,6 +5,8 @@ description = "Recurrent autoencoder model of hippocampal place cells (Wang et a
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ax-platform[notebook]>=1.3.1",
+    "botorch>=0.18.1",
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "numpy>=2.4.6",
@@ -21,12 +23,16 @@ dependencies = [
 
 [project.scripts]
 generate-room = "trajectories.generate_room:main"
-generate-cycles-rooms = "scripts.generate_cycles_rooms:main"
-cycles-experiment = "scripts.cycles_experiment:main"
+generate-oldcycles-rooms = "scripts.generate_oldcycles_rooms:main"
+old-cycles-experiment = "scripts.old_cycles_experiment:main"
+cycles-experiment = "scripts.old_cycles_experiment:main"
 recreate-paper-plots-cycles = "scripts.recreate_paper_plots_cycles:main"
-truncate-cycles-results = "cycles.truncate_cycles_results:main"
+truncate-cycles-results = "experiments.old_cycles.truncate_cycles_results:main"
 estimate-gaussians-rf = "scripts.estimate_gaussians_rf:main"
 benchmark-step-size = "scripts.benchmark_step_size:main"
+generate-experiment-room = "scripts.generate_experiment_room:main"
+run-experiment = "scripts.run_experiment:main"
+bayesian-opt-hyperparam = "scripts.bayesian_opt_hyperparam:main"
 
 [build-system]
 requires = ["setuptools >= 64"]
@@ -36,7 +42,13 @@ build-backend = "setuptools.build_meta"
 packages = [
     "analysis",
     "core",
-    "cycles",
+    "experiments",
+    "experiments.common",
+    "experiments.old_cycles",
+    "experiments.single_room",
+    "experiments.two_rooms",
+    "experiments.many_rooms",
+    "optimizers",
     "trajectories",
     "models",
     "nn4n",
@@ -74,4 +86,4 @@ torch = [
 torchvision = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
 ]
-torch-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+torch-shampoo = { git = "https://github.com/facebookresearch/optimizers.git", rev = "23b6ba547156ed5a3dd68a6f543e4858ed6ffbf6" }

@@ -24,11 +24,11 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from core.training import train_room_visit
-from cycles.constants import STEP_SIZE
-from cycles.cycles_data import load_manifest, load_room
-from cycles.cycles_paths import RESULTS_DIR, ROOMS_DIR
-from cycles.cycles_train import CyclesConfig
+from core.old_training import train_room_visit
+from experiments.old_cycles.constants import STEP_SIZE
+from experiments.old_cycles.cycles_data import load_manifest, load_room
+from experiments.old_cycles.cycles_paths import RESULTS_DIR, ROOMS_DIR
+from experiments.old_cycles.cycles_train import CyclesConfig
 from models.utils import build_rae
 
 # 75 s segment length → 75 * (1 s / STEP_SIZE) timesteps at full BPTT
@@ -119,7 +119,7 @@ def benchmark_step_sizes(
     manifest_path = rooms_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(
-            f"Missing {manifest_path}. Generate rooms with: uv run generate-cycles-rooms"
+            f"Missing {manifest_path}. Generate rooms with: uv run generate-oldcycles-rooms"
         )
 
     manifest = load_manifest(manifest_path)
@@ -240,7 +240,7 @@ def main(argv: list[str] | None = None) -> None:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    out_path.write_text(json.dumps(payload, indent=2) + "\n")
 
     print(f"\nWrote {out_path}")
     print("Summary (step_size → train_time_s):")

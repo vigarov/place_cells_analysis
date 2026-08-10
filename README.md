@@ -1,4 +1,8 @@
 # Place Cells Episodic RNN
+
+TODO: change
+
+
 ### Official Implementation of:
 > Z. Wang*, R. W. Di Tullio*, S. Rooke, and V. Balasubramanian. Time Makes Space: Emergence of Place Fields in Networks Encoding Temporally Continuous Sensory Experiences. In *NeurIPS 2024*.
 
@@ -26,17 +30,10 @@ Key findings:
 
 ## Running the code
 ### Virtual Environment
-#### Create a new conda environment
+#### Setup uv
 ```bash
-conda create -n place-rae python=3.10
-conda activate place-rae
-```
-
-#### Install the package
-```bash
-cd <project_root>
-pip install -e .
-# or: uv pip install -e .
+uv init
+uv sync
 ```
 
 ### Data
@@ -45,7 +42,10 @@ Pre-generated trajectories live under `data/`. Download from [Trajectories Googl
 Generate new rooms with:
 ```bash
 uv run generate-room --shape square --width 100
-uv run generate-cycles-rooms
+uv run generate-oldcycles-rooms   # old_cycles baseline (20 rooms, data/cycles/)
+uv run generate-experiment-room --config input_configs/single_room.json   # data/single_room/
+uv run generate-experiment-room --config input_configs/two_rooms.json      # data/two_rooms/
+uv run generate-experiment-room --config input_configs/many_rooms.json     # data/many_rooms/
 ```
 
 ### Project layout
@@ -53,8 +53,15 @@ uv run generate-cycles-rooms
 <project_root>/
 ├── src/
 │   ├── analysis/          # Gaussian RF fitting, cell evolution
-│   ├── cycles/            # Multi-room cycles experiment
-│   ├── core/              # Shared utils (WSM cells, rate maps)
+│   ├── core/              # Shared utils (WSM cells, TBPTT training, warmup,
+│   │                      #   gradient-signal capture, eval trajectories)
+│   ├── optimizers/        # 5 optimizer signal extractors (SGD/Adam/AdaGrad/
+│   │                      #   PureShampoo/GraftedShampoo)
+│   ├── experiments/
+│   │   ├── single_room/   # one room, many trajectories, per-trajectory warmup+training
+│   │   ├── two_rooms/     # two activity-biased rooms, alternating visits
+│   │   ├── many_rooms/    # many unbiased rooms visited in shuffled cycles
+│   │   └── old_cycles/    # frozen 20-room x 30-cycle baseline (original `cycles` experiment)
 │   ├── models/nn4n/       # Vendored NN4Neurosim RNN (import as nn4n)
 │   ├── trajectories/      # Room & trajectory generation
 │   └── scripts/           # CLI helpers
@@ -62,7 +69,10 @@ uv run generate-cycles-rooms
 │   ├── <room_name>/
 │   │   ├── traj_<speed>_<boundary_avoidance>.npz
 │   │   └── arena_map.npz
-│   └── cycles/            # 20-room cycles dataset
+│   ├── cycles/            # 20-room old_cycles dataset
+│   ├── single_room/
+│   ├── two_rooms/
+│   └── many_rooms/
 ├── ckpts/
 ├── plots/
 └── results/
@@ -107,9 +117,13 @@ The parameters `random_drift_magnitude`, `switch_direction_prob`, `switch_veloci
 Each trajectory file contains a tensor of shape `(B, Ts, 2)` with `B = 128` and `Ts = 2048s`, discretized at `50` ms bins (`2048 / 50 * 1000ms/s = 40960` steps). The last dimension stores the `(x, y)` coordinates of the trajectory, with each `.npz` file containing trajectories long enough to cover the entire arena.
 
 ## Training
-- Single-room training and method comparison: `src/analysis/notebook/training_methods.ipynb`
 - Cell evolution / Gaussian analysis: `src/analysis/notebook/cell_evolution.ipynb`
-- Multi-room cycles experiment: `uv run cycles-experiment` and `src/cycles/notebook/cycles_experiment.ipynb`
+- Frozen 20-room x 30-cycle baseline: `uv run old-cycles-experiment` (config: `input_configs/all_cycles.json`) and `src/experiments/old_cycles/notebook/cycles_experiment.ipynb`
+- `single_room`: `uv run generate-experiment-room --config input_configs/single_room.json` then `uv run run-experiment --config input_configs/single_room.json`
+- `two_rooms`: `uv run generate-experiment-room --config input_configs/two_rooms.json` then `uv run run-experiment --config input_configs/two_rooms.json`
+- `many_rooms`: `uv run generate-experiment-room --config input_configs/many_rooms.json` then `uv run run-experiment --config input_configs/many_rooms.json`
+
+Each of `single_room`/`two_rooms`/`many_rooms` warms up on a per-cell Gaussian-smoothed WSM signal, then trains with truncated BPTT (no batching), capturing `G_bptt_MSE`/`G_local_MSE`/`G_FR` gradient-credit signals (`src/core/gradient_signals.py`) and optimizer-internal signals (`src/optimizers/`) at every segment, plus activation rate maps computed from held-out evaluation trajectories. The optimizer (`sgd`, `adam`, `adagrad`, `pure_shampoo`, or `grafted_shampoo`) is selected via each config's `"optimizer"` section.
 
 Checkpoints, plots, and results are written to `ckpts/`, `plots/`, and `results/` at the repo root.
 
