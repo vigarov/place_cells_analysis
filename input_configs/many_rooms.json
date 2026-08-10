@@ -1,0 +1,60 @@
+{
+  "experiment_type": "many_rooms",
+  "description": "many_rooms experiment: 20 unbiased rooms (generated the same way as old_cycles), 200s trajectories. Pooled warmup across all rooms (60s TBPTT steps, per-cell Gaussian-smoothed signal, sigma=15). Main training visits all 20 rooms in a shuffled order each cycle (as in old_cycles); for each visit, trains on 4 trajectories one at a time in 20s TBPTT segments (no batching), capturing gradient/optimizer signals after every segment but activation rate maps only once at the end of each trajectory. Repeated for 10 cycles, reshuffling room order each cycle.",
+  "model": {
+    "activation": "relu",
+    "alpha": 0.1,
+    "learn_alpha": false,
+    "preact_noise": 0.0,
+    "postact_noise": 0.0
+  },
+  "many_rooms": {
+    "room": {
+      "n_rooms": 20,
+      "room_width_cm": 100,
+      "room_height_cm": null,
+      "n_wsm_cells": 200,
+      "wsm_sigma": 12,
+      "wsm_ssigma": 0,
+      "wsm_magnitude": 4.0,
+      "base_seed": 3003,
+      "speed": "med",
+      "boundary_avoidance": false
+    },
+    "trajectories": {
+      "trajectory_duration_s": 200.0,
+      "n_traj": 4,
+      "n_eval_traj": 128,
+      "eval_traj_duration_s": 350.0,
+      "n_warm_traj": 20
+    },
+    "warmup": {
+      "warmup_step_size_s": 60.0,
+      "warmup_gaussian_sigma": 15.0,
+      "warmup_shuffle": true,
+      "warmup_shuffle_seed": 3003
+
+    },
+    "training": {
+      "train_step_size_s": 20.0,
+      "n_hidden": 1000,
+      "learning_rate": 0.0005,
+      "lambda_mse": 1.0,
+      "lambda_fr": 200.0,
+      "mask_rate": 0.5,
+      "mask_method": "cell",
+      "mask_rng_seed": 3003,
+      "gradient_clip_max": 10,
+      "carry_state": false,
+      "max_units_per_layer": null,
+      "record_n_eval_segments": null,
+      "device": null
+    },
+    "n_cycles": 10,
+    "schedule_seed": 3003
+  },
+  "optimizer": {
+    "type": "adam",
+    "lr": 0.0005
+  }
+}

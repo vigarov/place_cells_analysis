@@ -1,0 +1,64 @@
+{
+  "experiment_type": "two_rooms",
+  "description": "two_rooms experiment: 2 rooms, 300s trajectories. Room 1's WSM signal is biased toward top-left, room 2's toward bottom-right. Warmup pools 8 trajectories from each room (16 total, 60s TBPTT steps, per-cell Gaussian-smoothed signal, sigma=15). Main training alternates 10 trajectories of room 1 then 10 of room 2 (20s TBPTT steps, no batching), repeated 3 times, capturing gradient/optimizer signals and activation rate maps (for both rooms) at every segment.",
+  "model": {
+    "activation": "relu",
+    "alpha": 0.1,
+    "learn_alpha": false,
+    "preact_noise": 0.0,
+    "postact_noise": 0.0
+  },
+  "two_rooms": {
+    "room": {
+      "n_rooms": 2,
+      "room_width_cm": 100,
+      "room_height_cm": null,
+      "n_wsm_cells": 200,
+      "wsm_sigma": 12,
+      "wsm_ssigma": 0,
+      "wsm_magnitude": 4.0,
+      "wsm_seeds": [3003, 3004],
+      "bias_corners": ["top_left", "bottom_right"],
+      "bias_strength": 0.1,
+      "bias_type": "post-noise",
+      "speed": "med",
+      "boundary_avoidance": false
+    },
+    "trajectories": {
+      "trajectory_duration_s": 300.0,
+      "n_warm_traj": 16,
+      "n_traj_per_room": 10,
+      "traj_seeds": [13003, 13004],
+      "n_eval_traj": 128,
+      "eval_traj_duration_s": 350.0,
+      "eval_traj_seeds": [23003, 23004]
+    },
+    "warmup": {
+      "warmup_step_size_s": 60.0,
+      "warmup_gaussian_sigma": 15.0,
+      "warmup_shuffle": true,
+      "warmup_shuffle_seed": 3003
+    },
+    "training": {
+      "train_step_size_s": 20.0,
+      "n_hidden": 1000,
+      "learning_rate": 0.0005,
+      "lambda_mse": 1.0,
+      "lambda_fr": 200.0,
+      "mask_rate": 0.5,
+      "mask_method": "cell",
+      "mask_rng_seed": 3003,
+      "gradient_clip_max": 10,
+      "carry_state": false,
+      "capture_every_n_segments": 1,
+      "max_units_per_layer": null,
+      "record_n_eval_segments": null,
+      "device": null
+    },
+    "n_repetitions": 3
+  },
+  "optimizer": {
+    "type": "adam",
+    "lr": 0.0005
+  }
+}
