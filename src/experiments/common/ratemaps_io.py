@@ -9,9 +9,11 @@
 # (where one ratemap is, logically, (n_hidden, H, W) )
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
+from tqdm.auto import tqdm
 
 
 def capture_tag_for_segment(*, pre: bool = False, seg_idx: int | None = None) -> str:
@@ -123,22 +125,114 @@ def _many_rooms_trajectory_key(stem: str) -> tuple[int, int, int] | None:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
+def _collect_trajectory_ratemap_paths(
+    ratemaps_dir: Path,
+    *,
+    experiment_name: str,
+    room_idx: int = 0,
+) -> list[Path]:
+    """Return trajectory NPZ paths relevant to ``experiment_name`` (unsorted)."""
+    ratemaps_dir = Path(ratemaps_dir)
+    paths: list[Path] = []
+
+    if experiment_name == "single_room":
+        for path in ratemaps_dir.glob("*.npz"):
+            if _single_room_trajectory_key(path.stem) is not None:
+                paths.append(path)
+    elif experiment_name == "two_rooms":
+        for path in ratemaps_dir.glob(f"*_room{room_idx}.npz"):
+            if _two_rooms_trajectory_key(path.stem, room_idx) is not None:
+                paths.append(path)
+    elif experiment_name == "many_rooms":
+        for path in ratemaps_dir.glob("*.npz"):
+            if _many_rooms_trajectory_key(path.stem) is not None:
+                paths.append(path)
+    else:
+        raise ValueError(f"Unsupported experiment: {experiment_name}")
+    return paths
+
+
+def load_stacked_capture_ratemaps(
+    captures: list[RatemapCaptureRef],
+    *,
+    show_progress: bool = True,
+) -> np.ndarray:
+    """
+    Stack captures into ``(n_captures, n_cells, H, W)`` float32.
+
+    Each trajectory NPZ is read once; slices are copied into the output array.
+    """
+    if not captures:
+        raise ValueError("No rate map captures to load")
+
+    slots_by_path: dict[Path, list[tuple[int, int]]] = defaultdict(list)
+    path_order: list[Path] = []
+    seen_paths: set[Path] = set()
+    for out_idx, ref in enumerate(captures):
+        slots_by_path[ref.path].append((out_idx, ref.capture_idx))
+        if ref.path not in seen_paths:
+            seen_paths.add(ref.path)
+            path_order.append(ref.path)
+
+    loaded: dict[Path, np.ndarray] = {}
+
+    def _get_file(path: Path) -> np.ndarray:
+        if path not in loaded:
+            file_data, _ = load_trajectory_ratemaps(path)
+            loaded[path] = file_data
+        return loaded[path]
+
+    first_file = _get_file(captures[0].path)
+    sample = np.asarray(first_file[captures[0].capture_idx], dtype=np.float32)
+    out = np.empty((len(captures), *sample.shape), dtype=np.float32)
+
+    path_iter: list[Path] | tqdm = path_order
+    if show_progress:
+        path_iter = tqdm(path_order, desc="Loading rate maps", unit="file")
+
+    for path in path_iter:
+        ratemaps_file = _get_file(path)
+        n_captures_in_file = ratemaps_file.shape[0]
+        for out_idx, capture_idx in slots_by_path[path]:
+            if capture_idx < 0 or capture_idx >= n_captures_in_file:
+                raise IndexError(
+                    f"capture_idx {capture_idx} out of range for {path} "
+                    f"(K={n_captures_in_file})"
+                )
+            out[out_idx] = np.asarray(ratemaps_file[capture_idx], dtype=np.float32)
+
+    loaded.clear()
+    return out
+
+
 def discover_ratemap_captures(
     ratemaps_dir: Path,
     *,
     experiment_name: str,
     room_idx: int = 0,
+    show_progress: bool = False,
+    tag_cache: dict[Path, list[str]] | None = None,
 ) -> list[RatemapCaptureRef]:
     """Return capture refs in training order (one ref per capture timepoint)."""
     ratemaps_dir = Path(ratemaps_dir)
     captures: list[tuple[tuple[int, ...], RatemapCaptureRef]] = []
+    paths = _collect_trajectory_ratemap_paths(
+        ratemaps_dir,
+        experiment_name=experiment_name,
+        room_idx=room_idx,
+    )
+    path_iter: list[Path] | tqdm = paths
+    if show_progress:
+        path_iter = tqdm(paths, desc="Discovering captures", unit="file")
 
     if experiment_name == "single_room":
-        for path in ratemaps_dir.glob("*.npz"):
+        for path in path_iter:
             traj_key = _single_room_trajectory_key(path.stem)
             if traj_key is None:
                 continue
             _, tags = load_trajectory_ratemaps(path)
+            if tag_cache is not None:
+                tag_cache[path] = tags
             epoch, traj = traj_key
             for capture_idx, tag in enumerate(tags):
                 captures.append(
@@ -149,11 +243,13 @@ def discover_ratemap_captures(
                 )
 
     elif experiment_name == "two_rooms":
-        for path in ratemaps_dir.glob(f"*_room{room_idx}.npz"):
+        for path in path_iter:
             traj_key = _two_rooms_trajectory_key(path.stem, room_idx)
             if traj_key is None:
                 continue
             _, tags = load_trajectory_ratemaps(path)
+            if tag_cache is not None:
+                tag_cache[path] = tags
             rep, visit_room, traj = traj_key
             for capture_idx, tag in enumerate(tags):
                 captures.append(
@@ -164,11 +260,13 @@ def discover_ratemap_captures(
                 )
 
     elif experiment_name == "many_rooms":
-        for path in ratemaps_dir.glob("*.npz"):
+        for path in path_iter:
             traj_key = _many_rooms_trajectory_key(path.stem)
             if traj_key is None:
                 continue
             _, tags = load_trajectory_ratemaps(path)
+            if tag_cache is not None:
+                tag_cache[path] = tags
             cyc, room, traj = traj_key
             for capture_idx, tag in enumerate(tags):
                 captures.append(

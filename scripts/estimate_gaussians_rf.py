@@ -27,11 +27,10 @@ from pathlib import Path
 
 import numpy as np
 
-from core.paths import RESULTS_DIR
 from experiments.common.ratemaps_io import (
     RatemapCaptureRef,
     discover_ratemap_captures,
-    load_ratemap_capture,
+    load_stacked_capture_ratemaps,
     load_trajectory_ratemaps,
     parse_capture_tag,
 )
@@ -55,8 +54,9 @@ def _partial_output_path(base: Path, part: int, n_parts: int) -> Path:
 
 
 def _infer_experiment_from_path(path: Path) -> str | None:
-    for parent in (path, *path.parents):
-        if parent.parent == RESULTS_DIR and parent.name in EXPERIMENT_TYPES:
+    """Return the nearest ancestor directory named like a room experiment."""
+    for parent in (path.resolve(), *path.resolve().parents):
+        if parent.name in EXPERIMENT_TYPES:
             return parent.name
     return None
 
@@ -140,12 +140,13 @@ def build_capture_metadata(
     experiment_name: str,
     ratemaps_dir: Path,
     room_idx: int,
+    tag_cache: dict[Path, list[str]] | None = None,
 ) -> dict[str, np.ndarray | str]:
     """Metadata arrays aligned with capture index (same order as ``captures``)."""
     if not captures:
         raise ValueError("No captures to describe")
 
-    tag_cache: dict[Path, list[str]] = {}
+    tags_by_path = tag_cache if tag_cache is not None else {}
     capture_tags: list[str] = []
     segment_ids: list[int] = []
     trajectory_files: list[str] = []
@@ -164,9 +165,9 @@ def build_capture_metadata(
         traj_ids = []
 
     for ref in captures:
-        if ref.path not in tag_cache:
-            _, tag_cache[ref.path] = load_trajectory_ratemaps(ref.path)
-        tag = tag_cache[ref.path][ref.capture_idx]
+        if ref.path not in tags_by_path:
+            _, tags_by_path[ref.path] = load_trajectory_ratemaps(ref.path)
+        tag = tags_by_path[ref.path][ref.capture_idx]
         stem = _trajectory_stem(ref)
         parsed = _parse_trajectory_ids(stem, experiment_name)
 
@@ -206,19 +207,6 @@ def build_capture_metadata(
         metadata["cycle_ids"] = np.asarray(cycle_ids, dtype=np.int32)
         metadata["room_ids"] = np.asarray(room_ids, dtype=np.int32)
     return metadata
-
-
-def load_capture_ratemaps(captures: list[RatemapCaptureRef]) -> np.ndarray:
-    """Stack captures into ``(n_captures, n_cells, H, W)`` float32."""
-    if not captures:
-        raise ValueError("No rate map captures to load")
-
-    first = load_ratemap_capture(captures[0])
-    out = np.empty((len(captures), *first.shape), dtype=np.float32)
-    out[0] = first
-    for idx, ref in enumerate(captures[1:], start=1):
-        out[idx] = load_ratemap_capture(ref)
-    return out
 
 
 def _slice_metadata(
@@ -338,10 +326,13 @@ def run_estimate(
         experiment=experiment,
         room_idx=room_idx,
     )
+    tag_cache: dict[Path, list[str]] = {}
     captures = discover_ratemap_captures(
         ratemaps_dir,
         experiment_name=experiment_name,
         room_idx=room_idx,
+        show_progress=show_progress,
+        tag_cache=tag_cache,
     )
     if not captures:
         raise FileNotFoundError(f"No rate map captures found under {ratemaps_dir}")
@@ -352,12 +343,13 @@ def run_estimate(
         experiment_name=experiment_name,
         ratemaps_dir=ratemaps_dir,
         room_idx=room_idx,
+        tag_cache=tag_cache,
     )
     output_path = results_dir / DEFAULT_OUTPUT_NAME
     workers = resolve_n_processes(n_processes, device=device)
 
     if memory_split <= 1:
-        ratemaps = load_capture_ratemaps(captures)
+        ratemaps = load_stacked_capture_ratemaps(captures, show_progress=show_progress)
         r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
@@ -391,7 +383,9 @@ def run_estimate(
         if capture_start >= capture_end:
             continue
         chunk_captures = captures[capture_start:capture_end]
-        ratemaps = load_capture_ratemaps(chunk_captures)
+        ratemaps = load_stacked_capture_ratemaps(
+            chunk_captures, show_progress=show_progress
+        )
         if n_cells is None:
             n_cells = ratemaps.shape[1]
         r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
