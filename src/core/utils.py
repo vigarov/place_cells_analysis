@@ -1,9 +1,48 @@
+from typing import Literal
+
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
-from core.training import masking
+MaskMethod = Literal["timestep", "cell"]
+
+
+def masking_timesteps(x, mask_rate, *, generator: torch.Generator | None = None):
+    """Zero whole timesteps; `mask_rate` = probability each timestep is zeroed."""
+    batch_size, timesteps, _ = x.shape
+    probs = torch.full((batch_size, timesteps), 1 - mask_rate)
+    if generator is None:
+        mask = torch.bernoulli(probs)
+    else:
+        mask = torch.bernoulli(probs, generator=generator)
+    return x * mask.unsqueeze(2).to(x.device)
+
+
+def masking_cells(x, mask_rate, *, generator: torch.Generator | None = None):
+    """Zero individual input cells; `mask_rate` = probability each cell is zeroed."""
+    keep_prob = 1.0 - mask_rate
+    probs = torch.full(x.shape, keep_prob)
+    if generator is None:
+        mask = torch.bernoulli(probs)
+    else:
+        mask = torch.bernoulli(probs, generator=generator)
+    return x * mask.to(x.device)
+
+
+def apply_input_mask(
+    x: torch.Tensor,
+    mask_rate: float,
+    *,
+    mask_method: MaskMethod = "timestep",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    if mask_method == "timestep":
+        return masking_timesteps(x, mask_rate, generator=generator)
+    if mask_method == "cell":
+        return masking_cells(x, mask_rate, generator=generator)
+    raise ValueError(f"mask_method must be 'timestep' or 'cell', got {mask_method!r}")
 
 
 def visualize_response_map(response_map, random_cell=False, im_width=3, n_cols=5, n_rows=2):
@@ -181,6 +220,7 @@ def advance_mask_generator_for_ratemap(
     step_size,
     n_test=None,
     *,
+    mask_method: MaskMethod = "timestep",
     mask_generator: torch.Generator | None = None,
 ) -> None:
     """
@@ -193,7 +233,12 @@ def advance_mask_generator_for_ratemap(
         for step in range(n_test):
             tc = traj_coord[:, step * step_size : (step + 1) * step_size]
             gt_res = torch.as_tensor(wsm.get_response(tc), dtype=torch.float32, device=device)
-            masking(gt_res[:, :-1], mask_rate, generator=mask_generator)
+            apply_input_mask(
+                gt_res[:, :-1],
+                mask_rate,
+                mask_method=mask_method,
+                generator=mask_generator,
+            )
 
 
 def compute_ratemap(
@@ -206,10 +251,16 @@ def compute_ratemap(
     step_size,
     n_test=None,
     *,
+    mask_method: MaskMethod = "timestep",
     mask_generator: torch.Generator | None = None,
     show_progress=False,
+    return_mse: bool = False,
 ):
-    """Aggregate RAE hidden-state rate maps over trajectory segments."""
+    """Aggregate RAE hidden-state rate maps over trajectory segments.
+
+    When `return_mse` is True, also return the mean unweighted MSE between
+    model predictions and ground-truth responses on the same segments.
+    """
     rm_agg = RatemapAggregator(arena_map=arena_map, device=device)
     max_steps = traj_coord.shape[1] // step_size
     if n_test is None:
@@ -219,13 +270,26 @@ def compute_ratemap(
     steps = range(n_test)
     if show_progress:
         steps = tqdm(steps, desc="Rate map", leave=False)
+    mse_values: list[float] = []
     with torch.no_grad():
         init_states = None
         for step in steps:
             tc = traj_coord[:, step * step_size : (step + 1) * step_size]
             gt_res = torch.as_tensor(wsm.get_response(tc), dtype=torch.float32).to(device)
-            masked_res = masking(gt_res[:, :-1], mask_rate, generator=mask_generator)
-            _, states = rae(masked_res, init_states=init_states)
+            masked_res = apply_input_mask(
+                gt_res[:, :-1],
+                mask_rate,
+                mask_method=mask_method,
+                generator=mask_generator,
+            )
+            gt_res_target = gt_res[:, 1:]
+            pred, states = rae(masked_res, init_states=init_states)
+            if return_mse:
+                mse_values.append(float(F.mse_loss(pred, gt_res_target).item()))
             init_states = [states[0][:, -1, :].clone()]
             rm_agg.update(coords=tc[:, 1:], states=states[0])
-    return rm_agg.get_ratemap().cpu().numpy()
+    ratemap = rm_agg.get_ratemap().cpu().numpy()
+    if return_mse:
+        mse = float(np.mean(mse_values)) if mse_values else float("nan")
+        return ratemap, mse
+    return ratemap
