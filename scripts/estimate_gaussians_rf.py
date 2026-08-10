@@ -36,7 +36,7 @@ from analysis.sum_gaussians_core import (
     _gaussian_2d,
     _make_sum_gaussians_model,
 )
-from cycles.ratemaps_io import (
+from experiments.old_cycles.ratemaps_io import (
     DEFAULT_CYCLES_RESULTS_DIR,
     DEFAULT_CYCLES_RESULTS_NAME,
     DEFAULT_CYCLES_RESULTS_PATH,

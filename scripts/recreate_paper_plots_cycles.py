@@ -8,11 +8,11 @@ Wang et al. (NeurIPS 2024): 20 rooms × 30 cycles → 600 recorded rate-map tria
   re-ordered by cycle (rooms sorted within each cycle).
 - **Suppl. Fig. 2**: drift of hidden units in Room 1 across cycles.
 
-Prerequisites: generate rooms under ``data/cycles/`` with::
+Prerequisites: generate rooms under `data/cycles/` with::
 
-    uv run generate-cycles-rooms
+    uv run generate-oldcycles-rooms
 
-Training (no plotting): ``uv run cycles-experiment``.
+Training (no plotting): `uv run old-cycles-experiment`.
 
 Usage::
 
@@ -26,9 +26,9 @@ import argparse
 from pathlib import Path
 
 from core.paths import ROOT
-from cycles.cycles_data import load_manifest
-from cycles.cycles_paths import ROOMS_DIR, resolve_cycles_paths
-from cycles.cycles_train import (
+from experiments.old_cycles.cycles_data import load_manifest
+from experiments.old_cycles.cycles_paths import ROOMS_DIR, resolve_cycles_paths
+from experiments.old_cycles.cycles_train import (
     CyclesConfig,
     load_cycles_experiment_config,
     load_cycles_result,
@@ -49,7 +49,7 @@ from analysis.cycles_plots import (
 DEFAULT_CONFIG_PATH = ROOT / "input_configs" / "all_cycles.json"
 DEFAULT_TRUNCATED_RESULTS_NAME = "cycles_ratemaps_truncated_10.npz"
 
-# Notebook defaults (`src/cycles/notebook/cycles_experiment.ipynb`).
+# Notebook defaults (`src/experiments/old_cycles/notebook/cycles_experiment.ipynb`).
 NOTEBOOK_CYCLES = CyclesConfig(
     n_cycles=30,
     n_rooms=20,

@@ -2,11 +2,11 @@
 """
 Truncate a completed cycles rate-map checkpoint to a cycle range.
 
-Keeps all room visits for cycles ``start .. end-1``. Output is written next to
+Keeps all room visits for cycles `start .. end-1`. Output is written next to
 the input file:
 
-- ``cycles_ratemaps_truncated_<end>.npz`` when ``start`` is 0
-- ``cycles_ratemaps_truncated_<start>_<end>.npz`` otherwise
+- `cycles_ratemaps_truncated_<end>.npz` when `start` is 0
+- `cycles_ratemaps_truncated_<start>_<end>.npz` otherwise
 
 Usage::
 
@@ -16,14 +16,11 @@ Usage::
 
     uv run truncate-cycles-results 30 --start 20 --input results/cycles/cycles_ratemaps.npz
 """
-
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
-from cycles.cycles_paths import RESULTS_DIR
-from cycles.cycles_train import (
+from experiments.old_cycles.cycles_paths import RESULTS_DIR
+from experiments.old_cycles.cycles_train import (
     DEFAULT_CYCLES_RESULTS_NAME,
     truncate_cycles_results,
 )

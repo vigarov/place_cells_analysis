@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from cycles.cycles_paths import MANIFEST_PATH, ROOMS_DIR
-from cycles.constants import (
+from experiments.old_cycles.cycles_paths import MANIFEST_PATH, ROOMS_DIR
+from experiments.old_cycles.constants import (
     ARENA_MAP_KEY,
     COORD_KEY,
     DT,
@@ -76,7 +76,7 @@ def truncate_trajectory_to_duration(
 
 def load_manifest(path: Path | None = None) -> CyclesManifest:
     path = Path(path or MANIFEST_PATH)
-    raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    raw: dict[str, Any] = json.loads(path.read_text())
     rooms = tuple(
         RoomSpec(
             index=r["index"],

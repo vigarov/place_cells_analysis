@@ -8,17 +8,22 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from cycles.cycles_paths import RESULTS_DIR, ROOMS_DIR, resolve_cycles_paths
-from cycles.constants import STEP_SIZE
+from experiments.old_cycles.cycles_paths import (
+    CyclesPathConfig,
+    RESULTS_DIR,
+    ROOMS_DIR,
+    resolve_cycles_paths,
+)
+from experiments.old_cycles.constants import STEP_SIZE
 from core.utils import compute_ratemap
 from models.utils import RaeModelConfig, build_rae, rae_model_config_from_dict
-from core.training import (
+from core.old_training import (
     TrainMode,
     rebatch_trajectories,
     resolve_n_segments,
     train_room_visit,
 )
-from cycles.cycles_data import (
+from experiments.old_cycles.cycles_data import (
     build_visit_schedule,
     flatten_schedule,
     load_manifest,
@@ -26,7 +31,7 @@ from cycles.cycles_data import (
     trial_steps_from_duration,
     truncate_trajectory_to_duration,
 )
-from cycles.ratemaps_io import (
+from experiments.old_cycles.ratemaps_io import (
     DEFAULT_CYCLES_RESULTS_NAME,
     DEFAULT_CYCLES_RESULTS_PRE_NAME,
     TRUNCATED_RATEMAPS_PREFIX,
@@ -40,7 +45,7 @@ DEFAULT_CHECKPOINT_EVERY_K_ROOMS = 10
 
 
 @dataclass
-class CyclesConfig:
+class CyclesConfig(CyclesPathConfig):
     """Hyperparameters for the 20-room x 30-cycle experiment."""
 
     # Paper Suppl. Table 1--2 (cycles use same architecture)
@@ -60,7 +65,7 @@ class CyclesConfig:
     record_n_segments: int | None = None  # None -> derive from trajectory or use all
 
     # If set, train and record rate maps on the first N seconds of each visit
-    # (e.g. 400 s of the 600 s trajectories from `generate-cycles-rooms`).
+    # (e.g. 400 s of the 600 s trajectories from `generate-oldcycles-rooms`).
     trajectory_duration_s: float | None = None
 
     # Sub-divisions per trajectory for rebatching (default: 4 for `default`, 8 for `indiv_traj`).
@@ -71,6 +76,10 @@ class CyclesConfig:
     device: str | None = None  # resolved in run_cycles_experiment
 
     gradient_clip_max: float | None = None
+
+    # When True, carry hidden state across segments (truncated BPTT); when False,
+    # each segment starts from a zero hidden state (original cycles behavior).
+    carry_state: bool = False
 
     model: RaeModelConfig = field(default_factory=RaeModelConfig)
 
@@ -106,7 +115,7 @@ def cycles_config_from_dict(raw: dict[str, Any]) -> CyclesConfig:
 
 def load_cycles_experiment_config(path: Path | str) -> CyclesExperimentRunConfig:
     """Load `input_configs/*.json` for the cycles training CLI."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(Path(path).read_text())
     if not isinstance(payload, dict):
         raise ValueError(f"Config root must be a JSON object: {path}")
 
@@ -438,7 +447,7 @@ def load_indiv_checkpoint(
 def _load_room_maps(path: Path) -> dict | None:
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text())
 
 
 def _save_room_maps(
@@ -457,7 +466,7 @@ def _save_room_maps(
         "n_rooms": int(schedule.shape[1]),
         "per_cycle": per_cycle,
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def _maybe_flush_room_maps(
@@ -634,7 +643,10 @@ def run_cycles_experiment(
         raise ValueError(
             f"config.n_rooms={config.n_rooms} exceeds manifest ({manifest.n_rooms} rooms)."
         )
-    n_seg = resolve_n_segments(config)
+    n_seg = resolve_n_segments(
+        n_segments=config.n_segments,
+        train_mode=config.train_mode,
+    )
     validate_trajectory_duration(
         config.trajectory_duration_s,
         manifest=manifest,

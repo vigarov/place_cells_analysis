@@ -10,7 +10,7 @@ TRUNCATED_RATEMAPS_PREFIX = "cycles_ratemaps_truncated_"
 TRUNCATED_RATEMAPS_PRE_PREFIX = "cycles_ratemaps_pre_truncated_"
 TRUNCATED_RATEMAPS_SUFFIX = ".npz"
 
-# Unresolved template path (same suffix as `cycles.cycles_paths.RESULTS_DIR`).
+# Unresolved template path (same suffix as `experiments.old_cycles.cycles_paths.RESULTS_DIR`).
 CYCLES_RESULTS_SUFFIX = "!DUR_!NSEG_!SS"
 DEFAULT_CYCLES_RESULTS_DIR = ROOT_RESULTS_DIR / "cycles" / CYCLES_RESULTS_SUFFIX
 DEFAULT_CYCLES_RESULTS_PATH = DEFAULT_CYCLES_RESULTS_DIR / DEFAULT_CYCLES_RESULTS_NAME

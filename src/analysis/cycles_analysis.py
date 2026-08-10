@@ -1,7 +1,7 @@
 """Analysis for Suppl. Figs. 1-2 (population vectors and correlations)."""
 import numpy as np
 
-from cycles.constants import DEFAULT_PADDING, POPULATION_BIN_SIZE_CM
+from experiments.old_cycles.constants import DEFAULT_PADDING, POPULATION_BIN_SIZE_CM
 
 
 def trial_metadata_from_schedule(

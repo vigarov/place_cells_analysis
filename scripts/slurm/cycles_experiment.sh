@@ -42,4 +42,4 @@ resolve_cycles_config "${1:-}"
 
 echo "cycles experiment config=${CYCLES_CONFIG}"
 
-run_uv cycles-experiment --config "${CYCLES_CONFIG}"
+run_uv old-cycles-experiment --config "${CYCLES_CONFIG}"

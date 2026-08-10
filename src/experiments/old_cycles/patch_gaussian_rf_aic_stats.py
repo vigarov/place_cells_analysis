@@ -9,9 +9,9 @@ formula as -analysis/cell_evolution_analysis.py-).
 
 Usage::
 
-    uv run python cycles/patch_gaussian_rf_aic_stats.py
+    uv run python src/experiments/old_cycles/patch_gaussian_rf_aic_stats.py
 
-    uv run python cycles/patch_gaussian_rf_aic_stats.py --results-dir cycles/results
+    uv run python src/experiments/old_cycles/patch_gaussian_rf_aic_stats.py --results-dir cycles/results
 """
 import argparse
 from pathlib import Path
@@ -23,8 +23,8 @@ from analysis.sum_gaussians_core import (
     _aic_from_least_squares,
     _make_sum_gaussians_model,
 )
-from cycles.cycles_paths import RESULTS_DIR
-from cycles.ratemaps_io import discover_truncated_ratemaps_series
+from experiments.old_cycles.cycles_paths import RESULTS_DIR
+from experiments.old_cycles.ratemaps_io import discover_truncated_ratemaps_series
 from scripts.estimate_gaussians_rf import (
     DEFAULT_OUTPUT_NAME,
     DEFAULT_TOTAL_CYCLES,

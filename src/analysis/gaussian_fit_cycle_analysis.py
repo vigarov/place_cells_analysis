@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.sum_gaussians_core import _gaussian_2d
-from cycles.ratemaps_io import parse_truncated_ratemaps_filename
+from experiments.old_cycles.ratemaps_io import parse_truncated_ratemaps_filename
 
 GAUSSIAN_PARAM_NAMES = ("amplitude", "mu_x", "mu_y", "sigma_x", "sigma_y")
 R2BandName = str  # "top" | "bottom"

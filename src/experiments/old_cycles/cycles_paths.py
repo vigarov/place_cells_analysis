@@ -1,8 +1,7 @@
 """Paths for the cycles experiment (code vs room data)."""
+import abc
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Protocol
 
 from core.paths import (
     CKPTS_DIR,
@@ -10,8 +9,8 @@ from core.paths import (
     PLOTS_DIR as _ROOT_PLOTS_DIR,
     RESULTS_DIR as _ROOT_RESULTS_DIR,
 )
-from core.training import TrainMode, resolve_n_segments
-from cycles.constants import CYCLES_TRIAL_DURATION_S, STEP_SIZE
+from core.old_training import TrainMode, resolve_n_segments
+from experiments.old_cycles.constants import CYCLES_TRIAL_DURATION_S, STEP_SIZE
 
 ROOMS_DIR = DATA_DIR / "cycles"
 MANIFEST_PATH = ROOMS_DIR / "manifest.json"
@@ -33,11 +32,24 @@ ROOM_MAPS_PATH = CKPT_DIR / "room_maps.json"
 GAUSSIAN_EVOLUTION_PLOTS_DIR = PLOTS_DIR / "gaussian_evolution"
 
 
-class _CyclesPathConfig(Protocol):
-    trajectory_duration_s: float | None
-    n_segments: int | None
-    step_size: int
-    train_mode: TrainMode
+class CyclesPathConfig(abc.ABC):
+    """Fields needed to resolve cycles experiment output paths."""
+
+    @property
+    @abc.abstractmethod
+    def trajectory_duration_s(self) -> float | None: ...
+
+    @property
+    @abc.abstractmethod
+    def n_segments(self) -> int | None: ...
+
+    @property
+    @abc.abstractmethod
+    def step_size(self) -> int: ...
+
+    @property
+    @abc.abstractmethod
+    def train_mode(self) -> TrainMode: ...
 
 
 @dataclass(frozen=True)
@@ -70,12 +82,7 @@ def resolve_cycles_suffix(
         if trajectory_duration_s is not None
         else CYCLES_TRIAL_DURATION_S
     )
-    n_seg = resolve_n_segments(
-        SimpleNamespace(
-            n_segments=n_segments,
-            train_mode=train_mode,
-        )
-    )
+    n_seg = resolve_n_segments(n_segments=n_segments, train_mode=train_mode)
     ss = step_size if step_size is not None else STEP_SIZE
     return (
         CYCLES_SUFFIX_TEMPLATE.replace("!DUR", f"{dur_s}s")
@@ -84,7 +91,7 @@ def resolve_cycles_suffix(
     )
 
 
-def resolve_cycles_paths(config: _CyclesPathConfig) -> CyclesPaths:
+def resolve_cycles_paths(config: CyclesPathConfig) -> CyclesPaths:
     """Resolve tagged results/plots/checkpoint dirs for a `CyclesConfig`."""
     suffix = resolve_cycles_suffix(
         trajectory_duration_s=config.trajectory_duration_s,

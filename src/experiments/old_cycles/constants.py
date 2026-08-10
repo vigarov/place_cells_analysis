@@ -2,7 +2,7 @@
 Constants for the cycles experiment.
 
 Trajectory timing, arena I/O keys, and padding come from
-``trajectories.constants``; values below are specific to the 20-room
+`trajectories.constants`; values below are specific to the 20-room
 × 30-cycle protocol (Wang et al. NeurIPS 2024, Sec. 3.4 / Suppl. Sec. 3.2).
 """
 
@@ -28,7 +28,7 @@ STEP_SIZE = int(round(EPISODIC_SEGMENT_S / DT))
 # Paper: 5 cm bins on 100 cm room → 20×20 population vector (Suppl. Sec. 3.1)
 POPULATION_BIN_SIZE_CM = 5
 
-# WSM files written by ``generate-cycles-rooms`` (not part of trajectory npz format)
+# WSM files written by `generate-oldcycles-rooms` (not part of trajectory npz format)
 WSM_RESPONSE_KEY = "response_map"
 
 # Default trajectory preset for cycles rooms (matches demo / cell_evolution notebooks)
