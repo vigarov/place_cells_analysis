@@ -3,7 +3,7 @@
   "description": "single_room experiment: one 100x100cm room, 600s trajectories. Warmup on 15 trajectories (60s TBPTT steps, per-cell Gaussian-smoothed WSM signal, sigma=15), then main training one trajectory at a time (10s TBPTT steps, no batching), capturing gradient/optimizer signals every segment and activation rate maps before each trajectory and after each segment. Rate maps are computed from 128 held-out 350s evaluation trajectories, never trained on.",
   "model": {
     "activation": "relu",
-    "alpha": 0.1,
+    "alpha": 0.1275,
     "learn_alpha": false,
     "preact_noise": 0.0,
     "postact_noise": 0.0
@@ -37,9 +37,9 @@
       "train_step_size_s": 10.0,
       "n_hidden": 1000,
       "learning_rate": 0.0005,
-      "lambda_mse": 1.0,
-      "lambda_fr": 200.0,
-      "mask_rate": 0.5,
+      "lambda_mse": 90.96,
+      "lambda_fr": 116.6,
+      "mask_rate": 0.4176,
       "mask_method": "cell",
       "mask_rng_seed": 3003,
       "gradient_clip_max": 10,
