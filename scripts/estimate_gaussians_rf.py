@@ -1,552 +1,238 @@
 #!/usr/bin/env python3
 """
-Fit N-Gaussian receptive fields to cycles experiment rate maps.
+Fit N-Gaussian receptive fields to room-experiment rate maps.
 
-For each visit and hidden unit, fits a sum of -n_gaussians- independent 2D
-Gaussians (same routine as `analysis.sum_gaussians`).
-Writes `gaussian_rf_fits.npz` (post) and `gaussian_rf_fits_pre.npz` (pre) next to
-the input results file or truncated-dir. Each output includes `r2`, `indiv_r2`,
-`gaussian_params`, `aic`, and per-rate-map `signal_mean` / `signal_max` /
-`signal_std`.
+Reads per-trajectory rate-map NPZs under ``<results_dir>/ratemaps/`` produced by
+``single_room``, ``two_rooms``, and ``many_rooms`` experiments. For each capture
+timepoint and hidden unit, fits a sum of *n_gaussians* independent 2D Gaussians
+(same routine as ``analysis.sum_gaussians``).
+
+Writes ``gaussian_rf_fits.npz`` in the experiment results directory. The output
+includes ``r2``, ``indiv_r2``, ``gaussian_params``, ``aic``, per-rate-map signal
+stats, and capture metadata (epoch/cycle, trajectory, segment, tags, source files).
 
 Usage::
 
-    uv run estimate-gaussians-rf
+    uv run estimate-gaussians-rf --input results/single_room/600s_warm15x60s_train10x10s_ep1
 
-    uv run estimate-gaussians-rf --input results/cycles
+    uv run estimate-gaussians-rf --input results/two_rooms/<suffix> --room-idx 1
 
-    uv run estimate-gaussians-rf --input results/cycles/cycles_ratemaps_pre.npz
-
-    uv run estimate-gaussians-rf --truncated-dir --input results/cycles
-
-    uv run estimate-gaussians-rf --device cpu --n-processes auto
+    uv run estimate-gaussians-rf --device cpu --n-processes auto --memory-split 4
 """
+from __future__ import annotations
+
 import argparse
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import shared_memory
+import re
 from pathlib import Path
 
 import numpy as np
-from tqdm.auto import tqdm
 
-from analysis.sum_gaussians import fit_sum_gaussians
-from analysis.sum_gaussians_core import (
-    _aic_from_least_squares,
-    _gaussian_2d,
-    _make_sum_gaussians_model,
+from core.paths import RESULTS_DIR
+from experiments.common.ratemaps_io import (
+    RatemapCaptureRef,
+    discover_ratemap_captures,
+    load_ratemap_capture,
+    load_trajectory_ratemaps,
+    parse_capture_tag,
 )
-from experiments.old_cycles.ratemaps_io import (
-    DEFAULT_CYCLES_RESULTS_DIR,
-    DEFAULT_CYCLES_RESULTS_NAME,
-    DEFAULT_CYCLES_RESULTS_PATH,
-    DEFAULT_CYCLES_RESULTS_PRE_NAME,
-    discover_cycles_ratemaps_in_dir,
-    discover_truncated_pre_ratemaps_series,
-    discover_truncated_ratemaps_series,
+from experiments.common.run import EXPERIMENT_TYPES
+from experiments.many_rooms.experiment import MANY_ROOMS_NAME
+from experiments.single_room.experiment import SINGLE_ROOM_NAME
+from experiments.two_rooms.experiment import TWO_ROOMS_NAME
+from scripts.old_estimate_gaussians_rf import (
+    _PARAM_NAMES,
+    fit_ratemaps,
+    resolve_n_processes,
+    visit_chunk_bounds,
 )
 
 DEFAULT_OUTPUT_NAME = "gaussian_rf_fits.npz"
-DEFAULT_OUTPUT_PRE_NAME = "gaussian_rf_fits_pre.npz"
-DEFAULT_TOTAL_CYCLES = 30
-CPU_WORKER_RESERVE = 4
-CURVES_PER_WORKER_CHUNK = 1000
-_PARAM_NAMES = ("amplitude", "mu_x", "mu_y", "sigma_x", "sigma_y")
-
-
-def default_cpu_process_count(*, reserve: int = CPU_WORKER_RESERVE) -> int:
-    """Worker count for ---n-processes auto-: -max(1, cpu_count() - reserve)-."""
-    count = os.cpu_count() or 1
-    return max(1, count - reserve)
-
-
-def resolve_n_processes(
-    n_processes: int | str,
-    *,
-    device: str,
-) -> int:
-    """Return process count (1 = serial). GPU always uses 1."""
-    if device != "cpu":
-        return 1
-    if n_processes == "auto":
-        return default_cpu_process_count()
-    if isinstance(n_processes, str):
-        raise ValueError(f"n_processes must be 'auto' or a positive int, got {n_processes!r}")
-    if n_processes < 1:
-        raise ValueError(f"n_processes must be >= 1, got {n_processes}")
-    return int(n_processes)
-
-
-def _pool_worker_init() -> None:
-    """Avoid BLAS/thread oversubscription inside each worker process."""
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-
-def _default_input_path() -> Path:
-    return DEFAULT_CYCLES_RESULTS_PATH
-
-
-def _fits_output_name_for_ratemaps(ratemaps_name: str) -> str:
-    """Map a rate-map NPZ filename to its Gaussian-fit output filename."""
-    if ratemaps_name == DEFAULT_CYCLES_RESULTS_PRE_NAME:
-        return DEFAULT_OUTPUT_PRE_NAME
-    if ratemaps_name == DEFAULT_CYCLES_RESULTS_NAME:
-        return DEFAULT_OUTPUT_NAME
-    if ratemaps_name.startswith("cycles_ratemaps_pre_truncated_"):
-        return DEFAULT_OUTPUT_PRE_NAME
-    if ratemaps_name.startswith("cycles_ratemaps_truncated_"):
-        return DEFAULT_OUTPUT_NAME
-    stem = ratemaps_name.removesuffix(".npz")
-    if stem.endswith("_pre"):
-        return f"gaussian_rf_fits_{stem.rsplit('_', 1)[-1]}.npz"
-    return f"gaussian_rf_fits_{stem}.npz"
-
-
-def _output_path(input_path: Path) -> Path:
-    """Gaussian-fit output path next to the input rate-map NPZ."""
-    return input_path.parent / _fits_output_name_for_ratemaps(input_path.name)
-
-
-def _output_path_for_dir(directory: Path, *, pre: bool = False) -> Path:
-    """Merged Gaussian-fit output for a results or truncated directory."""
-    name = DEFAULT_OUTPUT_PRE_NAME if pre else DEFAULT_OUTPUT_NAME
-    return Path(directory) / name
+_RATEMAPS_SUBDIR = "ratemaps"
 
 
 def _partial_output_path(base: Path, part: int, n_parts: int) -> Path:
     return base / f"gaussian_rf_fits.part{part:03d}_of_{n_parts:03d}.npz"
 
 
-def visit_chunk_bounds(n_visits: int, k_parts: int) -> list[tuple[int, int]]:
-    """Split -n_visits- into -k_parts- contiguous slices (last gets remainder)."""
-    if k_parts < 1:
-        raise ValueError(f"memory-split must be >= 1, got {k_parts}")
-    chunk = n_visits // k_parts
-    bounds: list[tuple[int, int]] = []
-    for i in range(k_parts):
-        start = i * chunk
-        end = start + chunk if i < k_parts - 1 else n_visits
-        bounds.append((start, end))
-    return bounds
+def _infer_experiment_from_path(path: Path) -> str | None:
+    for parent in (path, *path.parents):
+        if parent.parent == RESULTS_DIR and parent.name in EXPERIMENT_TYPES:
+            return parent.name
+    return None
 
 
-def _read_ratemap_shape(input_path: Path) -> tuple[int, int, int, int]:
-    with np.load(input_path, mmap_mode="r") as data:
-        shape = tuple(int(s) for s in data["ratemaps"].shape)
-    if len(shape) != 4:
-        raise ValueError(f"Expected ratemaps (n_visits, n_cells, H, W), got shape {shape}")
-    return shape  # type: ignore[return-value]
-
-
-def _load_ratemaps_file(input_path: Path) -> np.ndarray:
-    with np.load(input_path) as data:
-        return np.asarray(data["ratemaps"])
-
-
-def _load_metadata_arrays(
+def resolve_input(
     input_path: Path,
-    visit_start: int = 0,
-    visit_end: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    with np.load(input_path) as data:
-        cycle_ids = np.asarray(data["cycle_ids"])
-        room_ids = np.asarray(data["room_ids"])
-    if visit_end is not None:
-        cycle_ids = cycle_ids[visit_start:visit_end]
-        room_ids = room_ids[visit_start:visit_end]
-    elif visit_start:
-        cycle_ids = cycle_ids[visit_start:]
-        room_ids = room_ids[visit_start:]
-    return cycle_ids, room_ids
-
-
-def _curve_chunk_bounds(total_curves: int, chunk_size: int) -> list[tuple[int, int]]:
-    """-(flat_start, flat_end)- pairs covering -[0, total_curves)-."""
-    bounds: list[tuple[int, int]] = []
-    for start in range(0, total_curves, chunk_size):
-        bounds.append((start, min(start + chunk_size, total_curves)))
-    return bounds
-
-
-def _fit_curves_chunk_worker(
-    flat_start: int,
-    flat_end: int,
-    shm_name: str,
-    shape: tuple[int, int, int, int],
-    dtype_str: str,
-    n_gaussians: int,
-) -> tuple[
-    int,
-    int,
-    list[tuple[int, int, float, np.ndarray, np.ndarray, float, float, float, float]],
-]:
-    """
-    Fit up to -CURVES_PER_WORKER_CHUNK- (visit, cell) rate maps (module-level).
-
-    Returns -(flat_start, flat_end, [(visit, cell, r2, params, indiv_r2, aic,
-    signal_mean, signal_max, signal_std), ...])-.
-    """
-    shm = shared_memory.SharedMemory(name=shm_name)
-    try:
-        ratemaps = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=shm.buf)
-        n_cells = shape[1]
-        results: list[
-            tuple[int, int, float, np.ndarray, np.ndarray, float, float, float, float]
-        ] = []
-        for flat_idx in range(flat_start, flat_end):
-            visit_idx = flat_idx // n_cells
-            cell_idx = flat_idx % n_cells
-            results.append(
-                (
-                    visit_idx,
-                    cell_idx,
-                    *_fit_one_curve(
-                        ratemaps[visit_idx, cell_idx],
-                        n_gaussians=n_gaussians,
-                        device="cpu",
-                    ),
-                )
-            )
-        return flat_start, flat_end, results
-    finally:
-        shm.close()
-
-
-def _safe_fit_sum_gaussians(
-    field: np.ndarray,
     *,
-    n_gaussians: int,
-    device: str,
-) -> dict | None:
-    """Call :func:`fit_sum_gaussians`, returning -None- on any fit failure."""
-    try:
-        return fit_sum_gaussians(field, n_gaussians=n_gaussians, device=device)
-    except Exception:
-        return None
-
-
-def _signal_stats(field: np.ndarray) -> tuple[float, float, float]:
-    """-mean-, -max-, -std- over finite pixels (-nan- if none)."""
-    vals = field[np.isfinite(field)]
-    if vals.size == 0:
-        return np.nan, np.nan, np.nan
-    return float(vals.mean()), float(vals.max()), float(vals.std())
-
-
-def _aic_from_saved_params(
-    field: np.ndarray,
-    params: np.ndarray,
-    *,
-    n_gaussians: int,
-) -> float:
-    """AIC for a fixed parameter vector -(n_gaussians, 5)-."""
-    if not np.all(np.isfinite(params)):
-        return np.nan
-
-    mask = np.isfinite(field)
-    if not np.any(mask):
-        return np.nan
-
-    h, w = field.shape
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-    x_pts = xx[mask]
-    y_pts = yy[mask]
-    y_true = field[mask].astype(np.float64)
-
-    model = _make_sum_gaussians_model(n_gaussians)
-    popt = params.reshape(-1)
-    y_pred = model((x_pts, y_pts), *popt)
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    n_obs = int(y_true.size)
-    n_params = 5 * n_gaussians
-    return _aic_from_least_squares(n_obs, ss_res, n_params)
-
-
-def _indiv_r2_from_params(field: np.ndarray, params: np.ndarray) -> np.ndarray:
-    """Per-Gaussian R² with each component alone vs. finite pixels. Shape (n_gaussians,)."""
-    n_gaussians = params.shape[0]
-    out = np.full(n_gaussians, np.nan, dtype=np.float64)
-    if not np.all(np.isfinite(params)):
-        return out
-
-    mask = np.isfinite(field)
-    if not np.any(mask):
-        return out
-
-    h, w = field.shape
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-    x_pts = xx[mask]
-    y_pts = yy[mask]
-    y_true = field[mask].astype(np.float64)
-    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    if ss_tot <= 0:
-        return out
-
-    for k in range(n_gaussians):
-        y_pred = _gaussian_2d(params[k], x_pts, y_pts)
-        ss_res = float(np.sum((y_true - y_pred) ** 2))
-        out[k] = 1.0 - ss_res / ss_tot
-    return out
-
-
-def _params_from_fit(fit: dict, n_gaussians: int) -> np.ndarray:
-    """Shape -(n_gaussians, 5)-."""
-    out = np.full((n_gaussians, 5), np.nan, dtype=np.float64)
-    for k, comp in enumerate(fit["component_params"]):
-        if k >= n_gaussians:
-            break
-        out[k, 0] = comp["amplitude"]
-        out[k, 1] = comp["mu_x"]
-        out[k, 2] = comp["mu_y"]
-        out[k, 3] = comp["sigma_x"]
-        out[k, 4] = comp["sigma_y"]
-    return out
-
-
-def _fit_one_curve(
-    field: np.ndarray,
-    *,
-    n_gaussians: int,
-    device: str,
-) -> tuple[float, np.ndarray, np.ndarray, float, float, float, float]:
+    experiment: str | None,
+    room_idx: int,
+) -> tuple[Path, Path, str, int]:
     """
-    Fit one (visit, cell) rate map.
+    Resolve ``(results_dir, ratemaps_dir, experiment_name, room_idx)``.
 
-    Returns -r2-, -params-, -indiv_r2-, -aic-, -signal_mean-, -signal_max-,
-    -signal_std-. Failed fits leave -r2-, -params-, -indiv_r2-, and -aic- as
-    NaN but still record signal stats when the field has finite pixels.
+    Accepts either a run results directory or its ``ratemaps/`` subdirectory.
     """
-    signal_mean, signal_max, signal_std = _signal_stats(field)
-    fit = _safe_fit_sum_gaussians(field, n_gaussians=n_gaussians, device=device)
-    if fit is None:
-        return (
-            np.nan,
-            np.full((n_gaussians, 5), np.nan, dtype=np.float64),
-            np.full(n_gaussians, np.nan, dtype=np.float64),
-            np.nan,
-            signal_mean,
-            signal_max,
-            signal_std,
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(input_path)
+
+    if input_path.is_file():
+        raise ValueError(
+            f"--input must be a results directory or ratemaps directory, got file: {input_path}"
         )
 
-    params = _params_from_fit(fit, n_gaussians)
-    r2 = float(fit["r2"])
-    indiv_r2 = _indiv_r2_from_params(field, params)
-    aic_val = fit.get("aic")
-    if aic_val is None or not np.isfinite(aic_val):
-        aic = _aic_from_saved_params(field, params, n_gaussians=n_gaussians)
+    if input_path.name == _RATEMAPS_SUBDIR:
+        ratemaps_dir = input_path
+        results_dir = input_path.parent
+    elif (input_path / _RATEMAPS_SUBDIR).is_dir():
+        results_dir = input_path
+        ratemaps_dir = input_path / _RATEMAPS_SUBDIR
     else:
-        aic = float(aic_val)
-    return r2, params, indiv_r2, aic, signal_mean, signal_max, signal_std
-
-
-def _fit_ratemaps_serial(
-    ratemaps: np.ndarray,
-    *,
-    n_gaussians: int,
-    device: str,
-    show_progress: bool,
-    desc: str | None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    n_visits, n_cells, _, _ = ratemaps.shape
-    r2 = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    gaussian_params = np.full(
-        (n_visits, n_cells, n_gaussians, 5),
-        np.nan,
-        dtype=np.float64,
-    )
-    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
-    aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_std = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-
-    total = n_visits * n_cells
-    progress = tqdm(
-        total=total,
-        desc=desc or f"Gaussian RF fits (N={n_gaussians}, {device})",
-        disable=not show_progress,
-    )
-    try:
-        for cell_idx in range(n_cells):
-            for visit_idx in range(n_visits):
-                (
-                    r2[visit_idx, cell_idx],
-                    gaussian_params[visit_idx, cell_idx],
-                    indiv_r2[visit_idx, cell_idx],
-                    aic[visit_idx, cell_idx],
-                    signal_mean[visit_idx, cell_idx],
-                    signal_max[visit_idx, cell_idx],
-                    signal_std[visit_idx, cell_idx],
-                ) = _fit_one_curve(
-                    ratemaps[visit_idx, cell_idx],
-                    n_gaussians=n_gaussians,
-                    device=device,
-                )
-                progress.update(1)
-    finally:
-        progress.close()
-
-    return r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std
-
-
-def _fit_ratemaps_parallel(
-    ratemaps: np.ndarray,
-    *,
-    n_gaussians: int,
-    n_processes: int,
-    show_progress: bool,
-    desc: str | None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    n_visits, n_cells, _, _ = ratemaps.shape
-    r2 = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    gaussian_params = np.full(
-        (n_visits, n_cells, n_gaussians, 5),
-        np.nan,
-        dtype=np.float64,
-    )
-    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
-    aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_std = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-
-    shm = shared_memory.SharedMemory(create=True, size=ratemaps.nbytes)
-    try:
-        shared = np.ndarray(ratemaps.shape, dtype=ratemaps.dtype, buffer=shm.buf)
-        shared[:] = ratemaps[:]
-        del shared
-
-        shape = ratemaps.shape
-        dtype_str = str(ratemaps.dtype)
-        progress = tqdm(
-            total=n_visits * n_cells,
-            desc=desc
-            or (
-                f"Gaussian RF fits (N={n_gaussians}, cpu, "
-                f"{n_processes} processes)"
-            ),
-            disable=not show_progress,
+        raise FileNotFoundError(
+            f"Expected {_RATEMAPS_SUBDIR}/ under {input_path} (or pass the ratemaps dir directly)"
         )
-        total_curves = n_visits * n_cells
-        chunk_bounds = _curve_chunk_bounds(total_curves, CURVES_PER_WORKER_CHUNK)
-        try:
-            with ProcessPoolExecutor(
-                max_workers=n_processes,
-                initializer=_pool_worker_init,
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        _fit_curves_chunk_worker,
-                        flat_start,
-                        flat_end,
-                        shm.name,
-                        shape,
-                        dtype_str,
-                        n_gaussians,
-                    )
-                    for flat_start, flat_end in chunk_bounds
-                ]
-                for future in as_completed(futures):
-                    flat_start, flat_end, chunk_results = future.result()
-                    for (
-                        visit_idx,
-                        cell_idx,
-                        r2_val,
-                        params,
-                        indiv_r2_val,
-                        aic_val,
-                        mean_val,
-                        max_val,
-                        std_val,
-                    ) in chunk_results:
-                        r2[visit_idx, cell_idx] = r2_val
-                        gaussian_params[visit_idx, cell_idx] = params
-                        indiv_r2[visit_idx, cell_idx] = indiv_r2_val
-                        aic[visit_idx, cell_idx] = aic_val
-                        signal_mean[visit_idx, cell_idx] = mean_val
-                        signal_max[visit_idx, cell_idx] = max_val
-                        signal_std[visit_idx, cell_idx] = std_val
-                    progress.update(flat_end - flat_start)
-        finally:
-            progress.close()
-    finally:
-        shm.close()
-        shm.unlink()
 
-    return r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std
-
-
-def fit_ratemaps(
-    ratemaps: np.ndarray,
-    *,
-    n_gaussians: int,
-    device: str,
-    n_processes: int = 1,
-    show_progress: bool = True,
-    desc: str | None = None,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    """
-    Fit Gaussians for each (visit, cell).
-
-    With -device='cpu'- and -n_processes > 1-, fits one visit per worker using
-    a shared-memory view of -ratemaps-.
-
-    Returns
-    -------
-    r2
-        -(n_visits, n_cells)-
-    gaussian_params
-        -(n_visits, n_cells, n_gaussians, 5)-
-    indiv_r2
-        Per-Gaussian R², -(n_visits, n_cells, n_gaussians)-
-    aic
-        -(n_visits, n_cells)-
-    signal_mean, signal_max, signal_std
-        Per-rate-map signal stats over finite pixels, each -(n_visits, n_cells)-
-    """
-    if device == "cpu" and n_processes > 1:
-        return _fit_ratemaps_parallel(
-            ratemaps,
-            n_gaussians=n_gaussians,
-            n_processes=n_processes,
-            show_progress=show_progress,
-            desc=desc,
+    experiment_name = experiment or _infer_experiment_from_path(results_dir)
+    if experiment_name is None:
+        raise ValueError(
+            "Could not infer experiment type from --input path "
+            f"({results_dir}). Pass --experiment one of {sorted(EXPERIMENT_TYPES)}."
         )
-    return _fit_ratemaps_serial(
-        ratemaps,
-        n_gaussians=n_gaussians,
-        device=device,
-        show_progress=show_progress,
-        desc=desc,
-    )
+    if experiment_name not in EXPERIMENT_TYPES:
+        raise ValueError(
+            f"Unsupported --experiment {experiment_name!r}; "
+            f"expected one of {sorted(EXPERIMENT_TYPES)}"
+        )
+    if experiment_name == TWO_ROOMS_NAME and room_idx not in (0, 1):
+        raise ValueError(f"--room-idx must be 0 or 1 for two_rooms, got {room_idx}")
+    return results_dir, ratemaps_dir, experiment_name, room_idx
+
+
+def _trajectory_stem(ref: RatemapCaptureRef) -> str:
+    stem = ref.path.stem
+    if stem.endswith("_room0") or stem.endswith("_room1"):
+        return stem.rsplit("_room", 1)[0]
+    return stem
+
+
+def _parse_trajectory_ids(stem: str, experiment_name: str) -> tuple[int, ...]:
+    if experiment_name == SINGLE_ROOM_NAME:
+        m = re.fullmatch(r"epoch(\d+)_traj(\d+)", stem)
+        if m is None:
+            raise ValueError(f"Unexpected single_room trajectory file stem: {stem!r}")
+        return int(m.group(1)), int(m.group(2))
+    if experiment_name == TWO_ROOMS_NAME:
+        m = re.fullmatch(r"rep(\d+)_room(\d+)_traj(\d+)", stem)
+        if m is None:
+            raise ValueError(f"Unexpected two_rooms trajectory file stem: {stem!r}")
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if experiment_name == MANY_ROOMS_NAME:
+        m = re.fullmatch(r"cyc(\d+)_room(\d+)_traj(\d+)", stem)
+        if m is None:
+            raise ValueError(f"Unexpected many_rooms trajectory file stem: {stem!r}")
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    raise ValueError(f"Unsupported experiment: {experiment_name}")
+
+
+def build_capture_metadata(
+    captures: list[RatemapCaptureRef],
+    *,
+    experiment_name: str,
+    ratemaps_dir: Path,
+    room_idx: int,
+) -> dict[str, np.ndarray | str]:
+    """Metadata arrays aligned with capture index (same order as ``captures``)."""
+    if not captures:
+        raise ValueError("No captures to describe")
+
+    tag_cache: dict[Path, list[str]] = {}
+    capture_tags: list[str] = []
+    segment_ids: list[int] = []
+    trajectory_files: list[str] = []
+    file_capture_idx: list[int] = []
+
+    if experiment_name == SINGLE_ROOM_NAME:
+        epoch_ids: list[int] = []
+        traj_ids: list[int] = []
+    elif experiment_name == TWO_ROOMS_NAME:
+        rep_ids: list[int] = []
+        visit_room_ids: list[int] = []
+        traj_ids = []
+    else:
+        cycle_ids: list[int] = []
+        room_ids: list[int] = []
+        traj_ids = []
+
+    for ref in captures:
+        if ref.path not in tag_cache:
+            _, tag_cache[ref.path] = load_trajectory_ratemaps(ref.path)
+        tag = tag_cache[ref.path][ref.capture_idx]
+        stem = _trajectory_stem(ref)
+        parsed = _parse_trajectory_ids(stem, experiment_name)
+
+        capture_tags.append(tag)
+        segment_ids.append(parse_capture_tag(tag))
+        trajectory_files.append(str(ref.path.relative_to(ratemaps_dir)))
+        file_capture_idx.append(ref.capture_idx)
+
+        if experiment_name == SINGLE_ROOM_NAME:
+            epoch_ids.append(parsed[0])
+            traj_ids.append(parsed[1])
+        elif experiment_name == TWO_ROOMS_NAME:
+            rep_ids.append(parsed[0])
+            visit_room_ids.append(parsed[1])
+            traj_ids.append(parsed[2])
+        else:
+            cycle_ids.append(parsed[0])
+            room_ids.append(parsed[1])
+            traj_ids.append(parsed[2])
+
+    metadata: dict[str, np.ndarray | str] = {
+        "experiment_name": experiment_name,
+        "ratemaps_dir": str(ratemaps_dir),
+        "capture_tags": np.asarray(capture_tags),
+        "segment_ids": np.asarray(segment_ids, dtype=np.int32),
+        "trajectory_files": np.asarray(trajectory_files),
+        "file_capture_idx": np.asarray(file_capture_idx, dtype=np.int32),
+        "traj_ids": np.asarray(traj_ids, dtype=np.int32),
+    }
+    if experiment_name == SINGLE_ROOM_NAME:
+        metadata["epoch_ids"] = np.asarray(epoch_ids, dtype=np.int32)
+    elif experiment_name == TWO_ROOMS_NAME:
+        metadata["rep_ids"] = np.asarray(rep_ids, dtype=np.int32)
+        metadata["visit_room_ids"] = np.asarray(visit_room_ids, dtype=np.int32)
+        metadata["room_idx"] = np.int32(room_idx)
+    else:
+        metadata["cycle_ids"] = np.asarray(cycle_ids, dtype=np.int32)
+        metadata["room_ids"] = np.asarray(room_ids, dtype=np.int32)
+    return metadata
+
+
+def load_capture_ratemaps(captures: list[RatemapCaptureRef]) -> np.ndarray:
+    """Stack captures into ``(n_captures, n_cells, H, W)`` float32."""
+    if not captures:
+        raise ValueError("No rate map captures to load")
+
+    first = load_ratemap_capture(captures[0])
+    out = np.empty((len(captures), *first.shape), dtype=np.float32)
+    out[0] = first
+    for idx, ref in enumerate(captures[1:], start=1):
+        out[idx] = load_ratemap_capture(ref)
+    return out
+
+
+def _slice_metadata(
+    metadata: dict[str, np.ndarray | str],
+    start: int,
+    end: int,
+) -> dict[str, np.ndarray | str]:
+    sliced: dict[str, np.ndarray | str] = {}
+    for key, value in metadata.items():
+        if isinstance(value, str):
+            sliced[key] = value
+        else:
+            sliced[key] = np.asarray(value)[start:end]
+    return sliced
 
 
 def _save_fits(
@@ -559,12 +245,11 @@ def _save_fits(
     signal_mean: np.ndarray,
     signal_max: np.ndarray,
     signal_std: np.ndarray,
-    visit_start: int,
-    visit_end: int,
+    capture_start: int,
+    capture_end: int,
     n_gaussians: int,
     source_path: Path,
-    cycle_ids: np.ndarray | None = None,
-    room_ids: np.ndarray | None = None,
+    metadata: dict[str, np.ndarray | str],
 ) -> None:
     payload: dict[str, np.ndarray | int | str] = {
         "r2": r2,
@@ -574,16 +259,13 @@ def _save_fits(
         "signal_mean": signal_mean,
         "signal_max": signal_max,
         "signal_std": signal_std,
-        "visit_start": visit_start,
-        "visit_end": visit_end,
+        "capture_start": capture_start,
+        "capture_end": capture_end,
         "n_gaussians": n_gaussians,
         "param_names": np.array(_PARAM_NAMES),
         "source_path": str(source_path),
     }
-    if cycle_ids is not None:
-        payload["cycle_ids"] = cycle_ids
-    if room_ids is not None:
-        payload["room_ids"] = room_ids
+    payload.update(metadata)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **payload)
 
@@ -591,30 +273,29 @@ def _save_fits(
 def _merge_partial_files(
     partial_paths: list[Path],
     *,
-    n_visits: int,
+    n_captures: int,
     n_cells: int,
     n_gaussians: int,
     output_path: Path,
     source_path: Path,
+    metadata: dict[str, np.ndarray | str],
 ) -> None:
-    r2 = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
+    r2 = np.full((n_captures, n_cells), np.nan, dtype=np.float64)
     gaussian_params = np.full(
-        (n_visits, n_cells, n_gaussians, 5),
+        (n_captures, n_cells, n_gaussians, 5),
         np.nan,
         dtype=np.float64,
     )
-    indiv_r2 = np.full((n_visits, n_cells, n_gaussians), np.nan, dtype=np.float64)
-    aic = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_mean = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_max = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    signal_std = np.full((n_visits, n_cells), np.nan, dtype=np.float64)
-    cycle_parts: list[np.ndarray] = []
-    room_parts: list[np.ndarray] = []
+    indiv_r2 = np.full((n_captures, n_cells, n_gaussians), np.nan, dtype=np.float64)
+    aic = np.full((n_captures, n_cells), np.nan, dtype=np.float64)
+    signal_mean = np.full((n_captures, n_cells), np.nan, dtype=np.float64)
+    signal_max = np.full((n_captures, n_cells), np.nan, dtype=np.float64)
+    signal_std = np.full((n_captures, n_cells), np.nan, dtype=np.float64)
 
     for partial_path in partial_paths:
         with np.load(partial_path) as part:
-            start = int(part["visit_start"])
-            end = int(part["visit_end"])
+            start = int(part["capture_start"])
+            end = int(part["capture_end"])
             r2[start:end] = part["r2"]
             gaussian_params[start:end] = part["gaussian_params"]
             if "indiv_r2" in part:
@@ -623,21 +304,6 @@ def _merge_partial_files(
             signal_mean[start:end] = part["signal_mean"]
             signal_max[start:end] = part["signal_max"]
             signal_std[start:end] = part["signal_std"]
-            if "cycle_ids" in part:
-                cycle_parts.append((start, np.asarray(part["cycle_ids"])))
-            if "room_ids" in part:
-                room_parts.append((start, np.asarray(part["room_ids"])))
-
-    cycle_ids = None
-    room_ids = None
-    if cycle_parts:
-        cycle_ids = np.empty(n_visits, dtype=cycle_parts[0][1].dtype)
-        for start, values in cycle_parts:
-            cycle_ids[start : start + len(values)] = values
-    if room_parts:
-        room_ids = np.empty(n_visits, dtype=room_parts[0][1].dtype)
-        for start, values in room_parts:
-            room_ids[start : start + len(values)] = values
 
     _save_fits(
         output_path,
@@ -648,48 +314,58 @@ def _merge_partial_files(
         signal_mean=signal_mean,
         signal_max=signal_max,
         signal_std=signal_std,
-        visit_start=0,
-        visit_end=n_visits,
+        capture_start=0,
+        capture_end=n_captures,
         n_gaussians=n_gaussians,
         source_path=source_path,
-        cycle_ids=cycle_ids,
-        room_ids=room_ids,
+        metadata=metadata,
     )
 
 
-def _n_rooms_from_truncated_file(path: Path) -> int:
-    with np.load(path, mmap_mode="r") as data:
-        schedule = np.asarray(data["schedule"])
-    return int(schedule.shape[1])
-
-
-def run_estimate_single_file(
+def run_estimate(
     input_path: Path,
     *,
+    experiment: str | None = None,
+    room_idx: int = 0,
     n_gaussians: int = 2,
     memory_split: int = 1,
     device: str = "cpu",
-    n_processes: int = 1,
+    n_processes: int | str = "auto",
     show_progress: bool = True,
 ) -> Path:
-    input_path = Path(input_path)
-    if not input_path.is_file():
-        raise FileNotFoundError(input_path)
+    results_dir, ratemaps_dir, experiment_name, room_idx = resolve_input(
+        input_path,
+        experiment=experiment,
+        room_idx=room_idx,
+    )
+    captures = discover_ratemap_captures(
+        ratemaps_dir,
+        experiment_name=experiment_name,
+        room_idx=room_idx,
+    )
+    if not captures:
+        raise FileNotFoundError(f"No rate map captures found under {ratemaps_dir}")
 
-    n_visits, n_cells, _, _ = _read_ratemap_shape(input_path)
-    output_path = _output_path(input_path)
+    n_captures = len(captures)
+    metadata = build_capture_metadata(
+        captures,
+        experiment_name=experiment_name,
+        ratemaps_dir=ratemaps_dir,
+        room_idx=room_idx,
+    )
+    output_path = results_dir / DEFAULT_OUTPUT_NAME
+    workers = resolve_n_processes(n_processes, device=device)
 
     if memory_split <= 1:
-        ratemaps = _load_ratemaps_file(input_path)
+        ratemaps = load_capture_ratemaps(captures)
         r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
             device=device,
-            n_processes=n_processes,
+            n_processes=workers,
             show_progress=show_progress,
         )
         del ratemaps
-        cycle_ids, room_ids = _load_metadata_arrays(input_path)
         _save_fits(
             output_path,
             r2=r2,
@@ -699,39 +375,39 @@ def run_estimate_single_file(
             signal_mean=signal_mean,
             signal_max=signal_max,
             signal_std=signal_std,
-            visit_start=0,
-            visit_end=n_visits,
+            capture_start=0,
+            capture_end=n_captures,
             n_gaussians=n_gaussians,
-            source_path=input_path,
-            cycle_ids=cycle_ids,
-            room_ids=room_ids,
+            source_path=results_dir,
+            metadata=metadata,
         )
         return output_path
 
-    bounds = visit_chunk_bounds(n_visits, memory_split)
+    bounds = visit_chunk_bounds(n_captures, memory_split)
     partial_paths: list[Path] = []
-    for part_idx, (visit_start, visit_end) in enumerate(bounds):
-        if visit_start >= visit_end:
+    n_cells: int | None = None
+
+    for part_idx, (capture_start, capture_end) in enumerate(bounds):
+        if capture_start >= capture_end:
             continue
-        with np.load(input_path) as data:
-            ratemaps = np.asarray(data["ratemaps"][visit_start:visit_end])
+        chunk_captures = captures[capture_start:capture_end]
+        ratemaps = load_capture_ratemaps(chunk_captures)
+        if n_cells is None:
+            n_cells = ratemaps.shape[1]
         r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
             ratemaps,
             n_gaussians=n_gaussians,
             device=device,
-            n_processes=n_processes,
+            n_processes=workers,
             show_progress=show_progress,
             desc=(
                 f"Gaussian RF fits part {part_idx + 1}/{memory_split} "
-                f"(visits {visit_start}:{visit_end}, N={n_gaussians}, {device})"
+                f"(captures {capture_start}:{capture_end}, N={n_gaussians}, {device})"
             ),
         )
         del ratemaps
 
-        partial_path = _partial_output_path(input_path.parent, part_idx, memory_split)
-        cycle_ids, room_ids = _load_metadata_arrays(
-            input_path, visit_start, visit_end
-        )
+        partial_path = _partial_output_path(results_dir, part_idx, memory_split)
         _save_fits(
             partial_path,
             r2=r2,
@@ -741,243 +417,30 @@ def run_estimate_single_file(
             signal_mean=signal_mean,
             signal_max=signal_max,
             signal_std=signal_std,
-            visit_start=visit_start,
-            visit_end=visit_end,
+            capture_start=capture_start,
+            capture_end=capture_end,
             n_gaussians=n_gaussians,
-            source_path=input_path,
-            cycle_ids=cycle_ids,
-            room_ids=room_ids,
+            source_path=results_dir,
+            metadata=_slice_metadata(metadata, capture_start, capture_end),
         )
         partial_paths.append(partial_path)
-        del r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
+        del r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std
+
+    if n_cells is None:
+        raise RuntimeError("memory_split produced no non-empty capture chunks")
 
     _merge_partial_files(
         partial_paths,
-        n_visits=n_visits,
+        n_captures=n_captures,
         n_cells=n_cells,
         n_gaussians=n_gaussians,
         output_path=output_path,
-        source_path=input_path,
+        source_path=results_dir,
+        metadata=metadata,
     )
     for partial_path in partial_paths:
         partial_path.unlink(missing_ok=True)
-
     return output_path
-
-
-def _print_truncated_segments(
-    segments: list[tuple[int, int, Path]],
-    *,
-    total_cycles: int,
-) -> None:
-    print(f"Truncated segments (cycles [0, {total_cycles})):")
-    for start_cycle, end_cycle, path in segments:
-        print(f"  [{start_cycle}, {end_cycle}): {path}")
-
-
-def _run_estimate_truncated_series(
-    segments: list[tuple[int, int, Path]],
-    *,
-    output_path: Path,
-    source_path: Path,
-    total_cycles: int,
-    n_gaussians: int,
-    device: str,
-    n_processes: int,
-    show_progress: bool,
-) -> Path:
-    """Fit Gaussians across contiguous truncated rate-map segments."""
-    _print_truncated_segments(segments, total_cycles=total_cycles)
-    n_rooms = _n_rooms_from_truncated_file(segments[0][2])
-    n_visits = total_cycles * n_rooms
-    _, n_cells, _, _ = _read_ratemap_shape(segments[0][2])
-
-    partial_paths: list[Path] = []
-    n_parts = len(segments)
-    for part_idx, (start_cycle, end_cycle, segment_path) in enumerate(segments):
-        visit_start = start_cycle * n_rooms
-        visit_end = end_cycle * n_rooms
-        ratemaps = _load_ratemaps_file(segment_path)
-        if ratemaps.shape[0] != visit_end - visit_start:
-            raise ValueError(
-                f"{segment_path.name}: expected {visit_end - visit_start} visits, "
-                f"got {ratemaps.shape[0]}"
-            )
-
-        r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std = fit_ratemaps(
-            ratemaps,
-            n_gaussians=n_gaussians,
-            device=device,
-            n_processes=n_processes,
-            show_progress=show_progress,
-            desc=(
-                f"Gaussian RF fits {segment_path.name} "
-                f"(cycles {start_cycle}:{end_cycle}, N={n_gaussians}, {device})"
-            ),
-        )
-        del ratemaps
-
-        cycle_ids, room_ids = _load_metadata_arrays(segment_path)
-        partial_path = _partial_output_path(output_path.parent, part_idx, n_parts)
-        _save_fits(
-            partial_path,
-            r2=r2,
-            gaussian_params=gaussian_params,
-            indiv_r2=indiv_r2,
-            aic=aic,
-            signal_mean=signal_mean,
-            signal_max=signal_max,
-            signal_std=signal_std,
-            visit_start=visit_start,
-            visit_end=visit_end,
-            n_gaussians=n_gaussians,
-            source_path=segment_path,
-            cycle_ids=cycle_ids,
-            room_ids=room_ids,
-        )
-        partial_paths.append(partial_path)
-        del r2, gaussian_params, indiv_r2, aic, signal_mean, signal_max, signal_std, cycle_ids, room_ids
-
-    _merge_partial_files(
-        partial_paths,
-        n_visits=n_visits,
-        n_cells=n_cells,
-        n_gaussians=n_gaussians,
-        output_path=output_path,
-        source_path=source_path,
-    )
-    for partial_path in partial_paths:
-        partial_path.unlink(missing_ok=True)
-
-    return output_path
-
-
-def run_estimate_truncated_dir(
-    truncated_dir: Path,
-    *,
-    total_cycles: int = DEFAULT_TOTAL_CYCLES,
-    n_gaussians: int = 2,
-    device: str = "cpu",
-    n_processes: int = 1,
-    show_progress: bool = True,
-) -> list[Path]:
-    truncated_dir = Path(truncated_dir)
-    outputs: list[Path] = []
-
-    post_segments = discover_truncated_ratemaps_series(
-        truncated_dir, total_cycles=total_cycles
-    )
-    outputs.append(
-        _run_estimate_truncated_series(
-            post_segments,
-            output_path=_output_path_for_dir(truncated_dir, pre=False),
-            source_path=truncated_dir,
-            total_cycles=total_cycles,
-            n_gaussians=n_gaussians,
-            device=device,
-            n_processes=n_processes,
-            show_progress=show_progress,
-        )
-    )
-
-    try:
-        pre_segments = discover_truncated_pre_ratemaps_series(
-            truncated_dir, total_cycles=total_cycles
-        )
-    except FileNotFoundError:
-        pre_segments = None
-
-    if pre_segments is not None:
-        outputs.append(
-            _run_estimate_truncated_series(
-                pre_segments,
-                output_path=_output_path_for_dir(truncated_dir, pre=True),
-                source_path=truncated_dir,
-                total_cycles=total_cycles,
-                n_gaussians=n_gaussians,
-                device=device,
-                n_processes=n_processes,
-                show_progress=show_progress,
-            )
-        )
-
-    return outputs
-
-
-def run_estimate_results_dir(
-    results_dir: Path,
-    *,
-    n_gaussians: int = 2,
-    memory_split: int = 1,
-    device: str = "cpu",
-    n_processes: int = 1,
-    show_progress: bool = True,
-) -> list[Path]:
-    """Fit Gaussians for each rate-map NPZ discovered under `results_dir`."""
-    ratemap_paths = discover_cycles_ratemaps_in_dir(results_dir)
-    outputs: list[Path] = []
-    for ratemap_path in ratemap_paths:
-        outputs.append(
-            run_estimate_single_file(
-                ratemap_path,
-                n_gaussians=n_gaussians,
-                memory_split=memory_split,
-                device=device,
-                n_processes=n_processes,
-                show_progress=show_progress,
-            )
-        )
-    return outputs
-
-
-def run_estimate(
-    input_path: Path,
-    *,
-    truncated_dir: bool = False,
-    total_cycles: int = DEFAULT_TOTAL_CYCLES,
-    n_gaussians: int = 2,
-    memory_split: int = 1,
-    device: str = "cpu",
-    n_processes: int | str = "auto",
-    show_progress: bool = True,
-) -> Path | list[Path]:
-    input_path = Path(input_path)
-    workers = resolve_n_processes(n_processes, device=device)
-    if truncated_dir:
-        if not input_path.is_dir():
-            raise NotADirectoryError(
-                f"--truncated-dir requires --input to be a directory, got {input_path}"
-            )
-        if memory_split != 1:
-            raise ValueError(
-                "--memory-split cannot be used with --truncated-dir "
-                "(each truncated NPZ is already one segment)."
-            )
-        return run_estimate_truncated_dir(
-            input_path,
-            total_cycles=total_cycles,
-            n_gaussians=n_gaussians,
-            device=device,
-            n_processes=workers,
-            show_progress=show_progress,
-        )
-    if input_path.is_dir():
-        return run_estimate_results_dir(
-            input_path,
-            n_gaussians=n_gaussians,
-            memory_split=memory_split,
-            device=device,
-            n_processes=workers,
-            show_progress=show_progress,
-        )
-    return run_estimate_single_file(
-        input_path,
-        n_gaussians=n_gaussians,
-        memory_split=memory_split,
-        device=device,
-        n_processes=workers,
-        show_progress=show_progress,
-    )
 
 
 def _parse_n_processes_arg(value: str) -> int | str:
@@ -993,33 +456,32 @@ def _parse_n_processes_arg(value: str) -> int | str:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Fit N-Gaussian sums to cycles rate maps (per visit, per cell).",
+        description=(
+            "Fit N-Gaussian sums to room-experiment rate maps "
+            "(one fit per capture timepoint, per hidden unit)."
+        ),
     )
     parser.add_argument(
         "--input",
         type=Path,
+        required=True,
+        help=(
+            "Experiment results directory (containing ratemaps/) or the ratemaps/ "
+            "directory itself, e.g. results/single_room/<suffix>."
+        ),
+    )
+    parser.add_argument(
+        "--experiment",
+        choices=sorted(EXPERIMENT_TYPES),
         default=None,
-        help=(
-            f"Cycles results NPZ, results directory (fits post and pre rate maps "
-            f"when both exist), or directory of truncated NPZs with --truncated-dir "
-            f"(default file: results/{DEFAULT_CYCLES_RESULTS_NAME})."
-        ),
+        help="Experiment type (inferred from --input when omitted).",
     )
     parser.add_argument(
-        "--truncated-dir",
-        action="store_true",
-        dest="truncated_dir",
-        help=(
-            "Treat --input as a directory of cycles_ratemaps_truncated_*.npz files "
-            "that contiguously cover cycles [0, total_cycles)."
-        ),
-    )
-    parser.add_argument(
-        "--total-cycles",
+        "--room-idx",
         type=int,
-        default=DEFAULT_TOTAL_CYCLES,
-        metavar="N",
-        help=f"Expected final cycle index for --truncated-dir (default: {DEFAULT_TOTAL_CYCLES}).",
+        default=0,
+        choices=(0, 1),
+        help="For two_rooms: which room's rate maps to fit (default: 0).",
     )
     parser.add_argument(
         "--n-gaussians",
@@ -1034,8 +496,8 @@ def main(argv: list[str] | None = None) -> None:
         default=1,
         metavar="K",
         help=(
-            "Split visits into K chunks: reload the NPZ K times, keep only "
-            "len(visits)//K visits per pass, write partial NPZs, then merge."
+            "Split captures into K chunks: load K capture slices sequentially, "
+            "write partial NPZs, then merge."
         ),
     )
     parser.add_argument(
@@ -1065,36 +527,22 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--n-gaussians must be >= 1")
     if args.memory_split < 1:
         parser.error("--memory-split must be >= 1")
-    if args.total_cycles < 1:
-        parser.error("--total-cycles must be >= 1")
-
-    if args.truncated_dir:
-        if args.input is None:
-            input_path = DEFAULT_CYCLES_RESULTS_DIR
-        else:
-            input_path = args.input
-    else:
-        input_path = args.input or _default_input_path()
 
     workers = resolve_n_processes(args.n_processes, device=args.device)
     if args.device == "cpu" and workers > 1 and not args.quiet:
         print(f"Using {workers} CPU worker processes")
 
     out = run_estimate(
-        input_path,
-        truncated_dir=args.truncated_dir,
-        total_cycles=args.total_cycles,
+        args.input,
+        experiment=args.experiment,
+        room_idx=args.room_idx,
         n_gaussians=args.n_gaussians,
         memory_split=args.memory_split,
         device=args.device,
         n_processes=args.n_processes,
         show_progress=not args.quiet,
     )
-    if isinstance(out, list):
-        for path in out:
-            print(f"Wrote {path}")
-    else:
-        print(f"Wrote {out}")
+    print(f"Wrote {out}")
 
 
 if __name__ == "__main__":

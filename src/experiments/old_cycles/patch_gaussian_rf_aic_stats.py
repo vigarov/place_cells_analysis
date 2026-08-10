@@ -25,7 +25,7 @@ from analysis.sum_gaussians_core import (
 )
 from experiments.old_cycles.cycles_paths import RESULTS_DIR
 from experiments.old_cycles.ratemaps_io import discover_truncated_ratemaps_series
-from scripts.estimate_gaussians_rf import (
+from scripts.old_estimate_gaussians_rf import (
     DEFAULT_OUTPUT_NAME,
     DEFAULT_TOTAL_CYCLES,
     _n_rooms_from_truncated_file,
