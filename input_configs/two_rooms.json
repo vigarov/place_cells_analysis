@@ -3,7 +3,7 @@
   "description": "two_rooms experiment: 2 rooms, 300s trajectories. Room 1's WSM signal is biased toward top-left, room 2's toward bottom-right. Warmup pools 8 trajectories from each room (16 total, 60s TBPTT steps, per-cell Gaussian-smoothed signal, sigma=15). Main training alternates 10 trajectories of room 1 then 10 of room 2 (20s TBPTT steps, no batching), repeated 3 times, capturing gradient/optimizer signals and activation rate maps (for both rooms) at every segment.",
   "model": {
     "activation": "relu",
-    "alpha": 0.1,
+    "alpha": 0.1275,
     "learn_alpha": false,
     "preact_noise": 0.0,
     "postact_noise": 0.0
@@ -43,9 +43,9 @@
       "train_step_size_s": 20.0,
       "n_hidden": 1000,
       "learning_rate": 0.001,
-      "lambda_mse": 1.0,
-      "lambda_fr": 200.0,
-      "mask_rate": 0.5,
+      "lambda_mse": 90.96,
+      "lambda_fr": 116.6,
+      "mask_rate": 0.4176,
       "mask_method": "cell",
       "mask_rng_seed": 3003,
       "gradient_clip_max": 10,

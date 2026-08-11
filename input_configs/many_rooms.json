@@ -3,7 +3,7 @@
   "description": "many_rooms experiment: 20 unbiased rooms (generated the same way as old_cycles), 200s trajectories. Pooled warmup across all rooms (60s TBPTT steps, per-cell Gaussian-smoothed signal, sigma=15). Main training visits all 20 rooms in a shuffled order each cycle (as in old_cycles); for each visit, trains on 4 trajectories one at a time in 20s TBPTT segments (no batching), capturing gradient/optimizer signals after every segment but activation rate maps only once at the end of each trajectory. Repeated for 10 cycles, reshuffling room order each cycle.",
   "model": {
     "activation": "relu",
-    "alpha": 0.1,
+    "alpha": 0.1275,
     "learn_alpha": false,
     "preact_noise": 0.0,
     "postact_noise": 0.0
@@ -39,9 +39,9 @@
       "train_step_size_s": 20.0,
       "n_hidden": 1000,
       "learning_rate": 0.001,
-      "lambda_mse": 1.0,
-      "lambda_fr": 200.0,
-      "mask_rate": 0.5,
+      "lambda_mse": 90.96,
+      "lambda_fr": 116.6,
+      "mask_rate": 0.4176,
       "mask_method": "cell",
       "mask_rng_seed": 3003,
       "gradient_clip_max": 10,
