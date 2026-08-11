@@ -58,7 +58,7 @@ if [[ -z "${SLURM_JOB_ID:-}" && "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	EXTRA_ARGS=("$@")
 
 	mapfile -t PENDING < <(
-		run_uv estimate-gaussians-rf \
+		uv run estimate-gaussians-rf \
 			--input "${GAUSSIANS_INPUT}" \
 			--list-pending \
 			"${EXTRA_ARGS[@]}"
