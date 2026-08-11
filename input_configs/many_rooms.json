@@ -38,7 +38,7 @@
     "training": {
       "train_step_size_s": 20.0,
       "n_hidden": 1000,
-      "learning_rate": 0.0005,
+      "learning_rate": 0.001,
       "lambda_mse": 1.0,
       "lambda_fr": 200.0,
       "mask_rate": 0.5,
@@ -53,8 +53,5 @@
     "n_cycles": 10,
     "schedule_seed": 3003
   },
-  "optimizer": {
-    "type": "adam",
-    "lr": 0.0005
-  }
+  "optimizers": "all"
 }
