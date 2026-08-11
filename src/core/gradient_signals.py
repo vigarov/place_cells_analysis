@@ -105,7 +105,7 @@ def capture_step_signals(
     lambda_fr: float,
     readout_weight: torch.Tensor,
 ) -> StepGradientSignals:
-    """/!\ Call after `loss.backward()` (with `states.retain_grad()` set before the
+    r"""/!\ Call after `loss.backward()` (with `states.retain_grad()` set before the
     forward pass, on the hidden-state tensor whose `.grad` is passed in as
     `states_grad`) and before `optimizer.step()`.
     """

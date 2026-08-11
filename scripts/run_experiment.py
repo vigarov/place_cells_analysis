@@ -14,7 +14,12 @@ import argparse
 from pathlib import Path
 
 from core.training import run_experiment
-from experiments.common.run import create_experiment, load_experiment_config
+from experiments.common.run import (
+    create_experiment,
+    load_experiment_config,
+    run_is_complete,
+)
+from optimizers.defaults import build_optimizer_config
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -39,7 +44,21 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Config file not found: {args.config}")
 
     run_config = load_experiment_config(args.config)
-    run_experiment(create_experiment(run_config), show_progress_level=args.progress_level)
+    base_lr = run_config.config.training.learning_rate
+
+    for opt_type in run_config.optimizers:
+        optimizer_config = build_optimizer_config(opt_type, base_lr)
+        experiment = create_experiment(run_config, optimizer_config=optimizer_config)
+        paths = experiment.resolve_paths()
+        if run_is_complete(paths):
+            print(f"Skipping {opt_type} (results exist at {paths.results_dir})")
+            continue
+        run_experiment(
+            experiment,
+            show_progress_level=args.progress_level,
+            source_config_path=args.config,
+            experiment_type=run_config.experiment_type,
+        )
 
 
 if __name__ == "__main__":

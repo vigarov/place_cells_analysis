@@ -79,6 +79,12 @@ def trajectory_ratemap_path(
     return ratemaps_dir / f"{base_tag}.npz"
 
 
+def load_trajectory_capture_tags(path: Path) -> list[str]:
+    """Read `capture_tags` without loading the `ratemaps` array."""
+    with np.load(path) as data:
+        return [str(t) for t in data["capture_tags"]]
+
+
 def load_trajectory_ratemaps(path: Path) -> tuple[np.ndarray, list[str]]:
     with np.load(path) as data:
         ratemaps = np.asarray(data["ratemaps"])
@@ -131,7 +137,7 @@ def _collect_trajectory_ratemap_paths(
     experiment_name: str,
     room_idx: int = 0,
 ) -> list[Path]:
-    """Return trajectory NPZ paths relevant to ``experiment_name`` (unsorted)."""
+    """Return trajectory NPZ paths relevant to `experiment_name` (unsorted)."""
     ratemaps_dir = Path(ratemaps_dir)
     paths: list[Path] = []
 
@@ -158,7 +164,7 @@ def load_stacked_capture_ratemaps(
     show_progress: bool = True,
 ) -> np.ndarray:
     """
-    Stack captures into ``(n_captures, n_cells, H, W)`` float32.
+    Stack captures into `(n_captures, n_cells, H, W)` float32.
 
     Each trajectory NPZ is read once; slices are copied into the output array.
     """
@@ -230,7 +236,7 @@ def discover_ratemap_captures(
             traj_key = _single_room_trajectory_key(path.stem)
             if traj_key is None:
                 continue
-            _, tags = load_trajectory_ratemaps(path)
+            tags = load_trajectory_capture_tags(path)
             if tag_cache is not None:
                 tag_cache[path] = tags
             epoch, traj = traj_key
@@ -247,7 +253,7 @@ def discover_ratemap_captures(
             traj_key = _two_rooms_trajectory_key(path.stem, room_idx)
             if traj_key is None:
                 continue
-            _, tags = load_trajectory_ratemaps(path)
+            tags = load_trajectory_capture_tags(path)
             if tag_cache is not None:
                 tag_cache[path] = tags
             rep, visit_room, traj = traj_key
@@ -264,7 +270,7 @@ def discover_ratemap_captures(
             traj_key = _many_rooms_trajectory_key(path.stem)
             if traj_key is None:
                 continue
-            _, tags = load_trajectory_ratemaps(path)
+            tags = load_trajectory_capture_tags(path)
             if tag_cache is not None:
                 tag_cache[path] = tags
             cyc, room, traj = traj_key

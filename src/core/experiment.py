@@ -80,9 +80,16 @@ class RoomExperiment(abc.ABC):
     results_base: ClassVar[Path]
     ckpt_base: ClassVar[Path]
 
-    def __init__(self, config: ExperimentConfig, optimizer_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        optimizer_config: dict[str, Any],
+        *,
+        optimizer_tag: str | None = None,
+    ) -> None:
         self.config = config
         self.optimizer_config = optimizer_config
+        self.optimizer_tag = optimizer_tag
         self.dt: float = 0.05  # overwritten by `load_rooms()` from the room manifest
 
     @property
@@ -175,4 +182,9 @@ class RoomExperiment(abc.ABC):
 
     def resolve_paths(self) -> ExperimentPaths:
         """Resolve this run's results/signals/ratemaps/checkpoint directories."""
-        return resolve_experiment_paths(self.results_base, self.ckpt_base, self.suffix)
+        return resolve_experiment_paths(
+            self.results_base,
+            self.ckpt_base,
+            self.suffix,
+            optimizer_tag=self.optimizer_tag,
+        )

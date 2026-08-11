@@ -6,12 +6,17 @@ from typing import Any
 
 from core.experiment import RoomExperiment
 from experiments.common.config import ExperimentConfig, require_config_dict
+from experiments.common.paths import ExperimentPaths
 from experiments.many_rooms.config import load_many_rooms_experiment_config
 from experiments.many_rooms.experiment import MANY_ROOMS_NAME, ManyRoomsExperiment
 from experiments.single_room.config import load_single_room_experiment_config
 from experiments.single_room.experiment import SINGLE_ROOM_NAME, SingleRoomExperiment
 from experiments.two_rooms.config import load_two_rooms_experiment_config
 from experiments.two_rooms.experiment import TWO_ROOMS_NAME, TwoRoomsExperiment
+from optimizers.defaults import (
+    build_optimizer_config,
+    optimizer_tag_from_config,
+)
 
 EXPERIMENT_TYPES = frozenset({SINGLE_ROOM_NAME, TWO_ROOMS_NAME, MANY_ROOMS_NAME})
 
@@ -22,7 +27,12 @@ class ExperimentRunConfig:
 
     experiment_type: str
     config: ExperimentConfig
-    optimizer: dict[str, Any]
+    optimizers: list[str]
+
+
+def run_is_complete(paths: ExperimentPaths) -> bool:
+    """Return True when a prior run finished (``final.pth`` exists)."""
+    return (paths.ckpt_dir / "final.pth").is_file()
 
 
 def load_experiment_config(path: Path | str) -> ExperimentRunConfig:
@@ -45,32 +55,55 @@ def load_experiment_config(path: Path | str) -> ExperimentRunConfig:
         return ExperimentRunConfig(
             experiment_type=experiment_type,
             config=run_config.single_room,
-            optimizer=run_config.optimizer,
+            optimizers=run_config.optimizers,
         )
     if experiment_type == TWO_ROOMS_NAME:
         run_config = load_two_rooms_experiment_config(path)
         return ExperimentRunConfig(
             experiment_type=experiment_type,
             config=run_config.two_rooms,
-            optimizer=run_config.optimizer,
+            optimizers=run_config.optimizers,
         )
     run_config = load_many_rooms_experiment_config(path)
     return ExperimentRunConfig(
         experiment_type=experiment_type,
         config=run_config.many_rooms,
-        optimizer=run_config.optimizer,
+        optimizers=run_config.optimizers,
     )
 
 
-def create_experiment(run_config: ExperimentRunConfig) -> RoomExperiment:
+def create_experiment(
+    run_config: ExperimentRunConfig,
+    *,
+    optimizer_config: dict[str, Any] | None = None,
+) -> RoomExperiment:
     """Instantiate the experiment driver for a loaded run configuration."""
+    if optimizer_config is None:
+        opt_type = run_config.optimizers[0]
+        optimizer_config = build_optimizer_config(
+            opt_type, run_config.config.training.learning_rate
+        )
+    optimizer_tag = optimizer_tag_from_config(optimizer_config)
+
     experiment_type = run_config.experiment_type
     if experiment_type == SINGLE_ROOM_NAME:
-        return SingleRoomExperiment(run_config.config, run_config.optimizer)
+        return SingleRoomExperiment(
+            run_config.config,
+            optimizer_config,
+            optimizer_tag=optimizer_tag,
+        )
     if experiment_type == TWO_ROOMS_NAME:
-        return TwoRoomsExperiment(run_config.config, run_config.optimizer)
+        return TwoRoomsExperiment(
+            run_config.config,
+            optimizer_config,
+            optimizer_tag=optimizer_tag,
+        )
     if experiment_type == MANY_ROOMS_NAME:
-        return ManyRoomsExperiment(run_config.config, run_config.optimizer)
+        return ManyRoomsExperiment(
+            run_config.config,
+            optimizer_config,
+            optimizer_tag=optimizer_tag,
+        )
     raise ValueError(f"Unknown experiment_type: {experiment_type}")
 
 

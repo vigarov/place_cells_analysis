@@ -2,22 +2,27 @@
 """
 Fit N-Gaussian receptive fields to room-experiment rate maps.
 
-Reads per-trajectory rate-map NPZs under ``<results_dir>/ratemaps/`` produced by
-``single_room``, ``two_rooms``, and ``many_rooms`` experiments. For each capture
+Reads per-trajectory rate-map NPZs under `<results_dir>/ratemaps/` produced by
+`single_room`, `two_rooms`, and `many_rooms` experiments. For each capture
 timepoint and hidden unit, fits a sum of *n_gaussians* independent 2D Gaussians
-(same routine as ``analysis.sum_gaussians``).
+(same routine as `analysis.sum_gaussians`).
 
-Writes ``gaussian_rf_fits.npz`` in the experiment results directory. The output
-includes ``r2``, ``indiv_r2``, ``gaussian_params``, ``aic``, per-rate-map signal
-stats, and capture metadata (epoch/cycle, trajectory, segment, tags, source files).
+Writes `gaussian_rf_fits.npz` (or `gaussian_rf_fits_room0.npz` / `gaussian_rf_fits_room1.npz`
+for `two_rooms`) in each optimizer's results directory.
+
+When `--input` points at an experiment suffix directory, fits all optimizer
+subdirectories that contain `ratemaps/`, skipping those with existing outputs.
+
+For `two_rooms`, both rooms are fitted sequentially by default (room 0, then room 1).
+Pass `--room-idx` to fit a single room only.
 
 Usage::
 
     uv run estimate-gaussians-rf --input results/single_room/600s_warm15x60s_train10x10s_ep1
 
-    uv run estimate-gaussians-rf --input results/two_rooms/<suffix> --room-idx 1
+    uv run estimate-gaussians-rf --input results/two_rooms/<suffix>
 
-    uv run estimate-gaussians-rf --device cpu --n-processes auto --memory-split 4
+    uv run estimate-gaussians-rf --input results/two_rooms/<suffix> --room-idx 1
 """
 from __future__ import annotations
 
@@ -27,11 +32,17 @@ from pathlib import Path
 
 import numpy as np
 
+from experiments.common.paths import (
+    gaussian_rf_fits_path,
+    discover_optimizer_results_dirs,
+    filter_optimizer_results_dirs,
+    optimizer_run_complete,
+)
 from experiments.common.ratemaps_io import (
     RatemapCaptureRef,
     discover_ratemap_captures,
     load_stacked_capture_ratemaps,
-    load_trajectory_ratemaps,
+    load_trajectory_capture_tags,
     parse_capture_tag,
 )
 from experiments.common.run import EXPERIMENT_TYPES
@@ -46,11 +57,27 @@ from scripts.old_estimate_gaussians_rf import (
 )
 
 DEFAULT_OUTPUT_NAME = "gaussian_rf_fits.npz"
-_RATEMAPS_SUBDIR = "ratemaps"
 
 
-def _partial_output_path(base: Path, part: int, n_parts: int) -> Path:
-    return base / f"gaussian_rf_fits.part{part:03d}_of_{n_parts:03d}.npz"
+def _partial_output_path(
+    base: Path,
+    part: int,
+    n_parts: int,
+    *,
+    experiment_name: str,
+    room_idx: int,
+) -> Path:
+    fits_path = gaussian_rf_fits_path(base, experiment_name, room_idx)
+    stem = fits_path.stem
+    return base / f"{stem}.part{part:03d}_of_{n_parts:03d}.npz"
+
+
+def _fit_room_indices(experiment_name: str, room_idx: int | None) -> list[int]:
+    if experiment_name == TWO_ROOMS_NAME:
+        if room_idx is None:
+            return [0, 1]
+        return [room_idx]
+    return [0]
 
 
 def _infer_experiment_from_path(path: Path) -> str | None:
@@ -61,41 +88,22 @@ def _infer_experiment_from_path(path: Path) -> str | None:
     return None
 
 
-def resolve_input(
-    input_path: Path,
+def resolve_run(
+    results_dir: Path,
     *,
     experiment: str | None,
-    room_idx: int,
-) -> tuple[Path, Path, str, int]:
-    """
-    Resolve ``(results_dir, ratemaps_dir, experiment_name, room_idx)``.
-
-    Accepts either a run results directory or its ``ratemaps/`` subdirectory.
-    """
-    input_path = Path(input_path)
-    if not input_path.exists():
-        raise FileNotFoundError(input_path)
-
-    if input_path.is_file():
-        raise ValueError(
-            f"--input must be a results directory or ratemaps directory, got file: {input_path}"
-        )
-
-    if input_path.name == _RATEMAPS_SUBDIR:
-        ratemaps_dir = input_path
-        results_dir = input_path.parent
-    elif (input_path / _RATEMAPS_SUBDIR).is_dir():
-        results_dir = input_path
-        ratemaps_dir = input_path / _RATEMAPS_SUBDIR
-    else:
-        raise FileNotFoundError(
-            f"Expected {_RATEMAPS_SUBDIR}/ under {input_path} (or pass the ratemaps dir directly)"
-        )
+    room_idx: int | None,
+) -> tuple[Path, Path, str, int | None]:
+    """Resolve `(results_dir, ratemaps_dir, experiment_name, room_idx)`."""
+    results_dir = Path(results_dir)
+    ratemaps_dir = results_dir / "ratemaps"
+    if not ratemaps_dir.is_dir():
+        raise FileNotFoundError(f"Missing ratemaps directory: {ratemaps_dir}")
 
     experiment_name = experiment or _infer_experiment_from_path(results_dir)
     if experiment_name is None:
         raise ValueError(
-            "Could not infer experiment type from --input path "
+            "Could not infer experiment type from results path "
             f"({results_dir}). Pass --experiment one of {sorted(EXPERIMENT_TYPES)}."
         )
     if experiment_name not in EXPERIMENT_TYPES:
@@ -103,7 +111,11 @@ def resolve_input(
             f"Unsupported --experiment {experiment_name!r}; "
             f"expected one of {sorted(EXPERIMENT_TYPES)}"
         )
-    if experiment_name == TWO_ROOMS_NAME and room_idx not in (0, 1):
+    if (
+        experiment_name == TWO_ROOMS_NAME
+        and room_idx is not None
+        and room_idx not in (0, 1)
+    ):
         raise ValueError(f"--room-idx must be 0 or 1 for two_rooms, got {room_idx}")
     return results_dir, ratemaps_dir, experiment_name, room_idx
 
@@ -140,9 +152,10 @@ def build_capture_metadata(
     experiment_name: str,
     ratemaps_dir: Path,
     room_idx: int,
+    optimizer_tag: str,
     tag_cache: dict[Path, list[str]] | None = None,
 ) -> dict[str, np.ndarray | str]:
-    """Metadata arrays aligned with capture index (same order as ``captures``)."""
+    """Metadata arrays aligned with capture index (same order as `captures`)."""
     if not captures:
         raise ValueError("No captures to describe")
 
@@ -166,7 +179,7 @@ def build_capture_metadata(
 
     for ref in captures:
         if ref.path not in tags_by_path:
-            _, tags_by_path[ref.path] = load_trajectory_ratemaps(ref.path)
+            tags_by_path[ref.path] = load_trajectory_capture_tags(ref.path)
         tag = tags_by_path[ref.path][ref.capture_idx]
         stem = _trajectory_stem(ref)
         parsed = _parse_trajectory_ids(stem, experiment_name)
@@ -190,6 +203,7 @@ def build_capture_metadata(
 
     metadata: dict[str, np.ndarray | str] = {
         "experiment_name": experiment_name,
+        "optimizer_tag": optimizer_tag,
         "ratemaps_dir": str(ratemaps_dir),
         "capture_tags": np.asarray(capture_tags),
         "segment_ids": np.asarray(segment_ids, dtype=np.int32),
@@ -310,22 +324,18 @@ def _merge_partial_files(
     )
 
 
-def run_estimate(
-    input_path: Path,
+def _run_estimate_one_room(
+    results_dir: Path,
+    ratemaps_dir: Path,
     *,
-    experiment: str | None = None,
-    room_idx: int = 0,
-    n_gaussians: int = 2,
-    memory_split: int = 1,
-    device: str = "cpu",
-    n_processes: int | str = "auto",
-    show_progress: bool = True,
+    experiment_name: str,
+    room_idx: int,
+    n_gaussians: int,
+    memory_split: int,
+    device: str,
+    n_processes: int | str,
+    show_progress: bool,
 ) -> Path:
-    results_dir, ratemaps_dir, experiment_name, room_idx = resolve_input(
-        input_path,
-        experiment=experiment,
-        room_idx=room_idx,
-    )
     tag_cache: dict[Path, list[str]] = {}
     captures = discover_ratemap_captures(
         ratemaps_dir,
@@ -335,7 +345,9 @@ def run_estimate(
         tag_cache=tag_cache,
     )
     if not captures:
-        raise FileNotFoundError(f"No rate map captures found under {ratemaps_dir}")
+        raise FileNotFoundError(
+            f"No rate map captures found under {ratemaps_dir} (room_idx={room_idx})"
+        )
 
     n_captures = len(captures)
     metadata = build_capture_metadata(
@@ -343,9 +355,10 @@ def run_estimate(
         experiment_name=experiment_name,
         ratemaps_dir=ratemaps_dir,
         room_idx=room_idx,
+        optimizer_tag=results_dir.name,
         tag_cache=tag_cache,
     )
-    output_path = results_dir / DEFAULT_OUTPUT_NAME
+    output_path = gaussian_rf_fits_path(results_dir, experiment_name, room_idx)
     workers = resolve_n_processes(n_processes, device=device)
 
     if memory_split <= 1:
@@ -356,6 +369,11 @@ def run_estimate(
             device=device,
             n_processes=workers,
             show_progress=show_progress,
+            desc=(
+                f"Gaussian RF fits room {room_idx} (N={n_gaussians}, {device})"
+                if experiment_name == TWO_ROOMS_NAME
+                else None
+            ),
         )
         del ratemaps
         _save_fits(
@@ -395,13 +413,19 @@ def run_estimate(
             n_processes=workers,
             show_progress=show_progress,
             desc=(
-                f"Gaussian RF fits part {part_idx + 1}/{memory_split} "
+                f"Gaussian RF fits room {room_idx} part {part_idx + 1}/{memory_split} "
                 f"(captures {capture_start}:{capture_end}, N={n_gaussians}, {device})"
             ),
         )
         del ratemaps
 
-        partial_path = _partial_output_path(results_dir, part_idx, memory_split)
+        partial_path = _partial_output_path(
+            results_dir,
+            part_idx,
+            memory_split,
+            experiment_name=experiment_name,
+            room_idx=room_idx,
+        )
         _save_fits(
             partial_path,
             r2=r2,
@@ -437,6 +461,135 @@ def run_estimate(
     return output_path
 
 
+def run_estimate(
+    results_dir: Path,
+    *,
+    experiment: str | None = None,
+    room_idx: int | None = None,
+    n_gaussians: int = 2,
+    memory_split: int = 1,
+    device: str = "cpu",
+    n_processes: int | str = "auto",
+    show_progress: bool = True,
+    force: bool = False,
+) -> list[Path]:
+    results_dir, ratemaps_dir, experiment_name, room_idx = resolve_run(
+        results_dir,
+        experiment=experiment,
+        room_idx=room_idx,
+    )
+    outputs: list[Path] = []
+    for fit_room_idx in _fit_room_indices(experiment_name, room_idx):
+        output_path = gaussian_rf_fits_path(results_dir, experiment_name, fit_room_idx)
+        if not force and output_path.is_file():
+            print(f"Skipping {results_dir} ({output_path.name} exists)")
+            continue
+        if experiment_name == TWO_ROOMS_NAME and len(_fit_room_indices(experiment_name, room_idx)) > 1:
+            print(f"Fitting {results_dir} room {fit_room_idx}")
+        outputs.append(
+            _run_estimate_one_room(
+                results_dir,
+                ratemaps_dir,
+                experiment_name=experiment_name,
+                room_idx=fit_room_idx,
+                n_gaussians=n_gaussians,
+                memory_split=memory_split,
+                device=device,
+                n_processes=n_processes,
+                show_progress=show_progress,
+            )
+        )
+    return outputs
+
+
+def resolve_optimizer_runs(
+    input_path: Path,
+    *,
+    optimizers: list[str] | None = None,
+) -> list[Path]:
+    """Discover and optionally filter optimizer results directories."""
+    results_dirs = discover_optimizer_results_dirs(input_path)
+    return filter_optimizer_results_dirs(results_dirs, optimizers)
+
+
+def list_pending_optimizer_tags(
+    input_path: Path,
+    *,
+    experiment: str | None = None,
+    room_idx: int | None = None,
+    optimizers: list[str] | None = None,
+    force: bool = False,
+) -> list[str]:
+    """Return optimizer tags under `input_path` that still need Gaussian RF fits."""
+    pending: list[str] = []
+    for results_dir in resolve_optimizer_runs(input_path, optimizers=optimizers):
+        experiment_name = experiment or _infer_experiment_from_path(results_dir)
+        if experiment_name is None:
+            raise ValueError(
+                f"Could not infer experiment type from {results_dir}; pass --experiment"
+            )
+        if force or not optimizer_run_complete(
+            results_dir,
+            experiment_name=experiment_name,
+            room_idx=room_idx,
+        ):
+            pending.append(results_dir.name)
+    return pending
+
+
+def run_estimates(
+    input_path: Path,
+    *,
+    experiment: str | None = None,
+    room_idx: int | None = None,
+    optimizers: list[str] | None = None,
+    n_gaussians: int = 2,
+    memory_split: int = 1,
+    device: str = "cpu",
+    n_processes: int | str = "auto",
+    show_progress: bool = True,
+    force: bool = False,
+) -> list[Path]:
+    """Fit Gaussians for each selected optimizer run discovered under `input_path`."""
+    results_dirs = resolve_optimizer_runs(input_path, optimizers=optimizers)
+    outputs: list[Path] = []
+
+    for results_dir in results_dirs:
+        experiment_name = experiment or _infer_experiment_from_path(results_dir)
+        if experiment_name is None:
+            raise ValueError(
+                f"Could not infer experiment type from {results_dir}; pass --experiment"
+            )
+        if not force and optimizer_run_complete(
+            results_dir,
+            experiment_name=experiment_name,
+            room_idx=room_idx,
+        ):
+            label = DEFAULT_OUTPUT_NAME
+            if experiment_name == TWO_ROOMS_NAME and room_idx is None:
+                label = "gaussian_rf_fits_room{0,1}.npz"
+            elif experiment_name == TWO_ROOMS_NAME:
+                label = f"gaussian_rf_fits_room{room_idx}.npz"
+            print(f"Skipping {results_dir} ({label} exists)")
+            continue
+        if len(results_dirs) > 1:
+            print(f"Fitting {results_dir}")
+        outputs.extend(
+            run_estimate(
+                results_dir,
+                experiment=experiment,
+                room_idx=room_idx,
+                n_gaussians=n_gaussians,
+                memory_split=memory_split,
+                device=device,
+                n_processes=n_processes,
+                show_progress=show_progress,
+                force=force,
+            )
+        )
+    return outputs
+
+
 def _parse_n_processes_arg(value: str) -> int | str:
     if value == "auto":
         return "auto"
@@ -452,7 +605,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Fit N-Gaussian sums to room-experiment rate maps "
-            "(one fit per capture timepoint, per hidden unit)."
+            "(one fit per capture timepoint, per hidden unit). "
+            "When --input is an experiment suffix directory, processes all "
+            "optimizer subdirectories and skips those with existing fits."
         ),
     )
     parser.add_argument(
@@ -460,8 +615,28 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         required=True,
         help=(
-            "Experiment results directory (containing ratemaps/) or the ratemaps/ "
-            "directory itself, e.g. results/single_room/<suffix>."
+            "Experiment suffix directory (all optimizers), a single optimizer "
+            "results directory, or a ratemaps/ directory."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer",
+        action="append",
+        dest="optimizers",
+        metavar="TAG",
+        help=(
+            "Optimizer results subdirectory name (e.g. adam_0.001). "
+            "Repeat for multiple optimizers. When omitted on a suffix directory, "
+            "all available optimizers are considered."
+        ),
+    )
+    parser.add_argument(
+        "--list-pending",
+        action="store_true",
+        help=(
+            "Print optimizer tags that still need fits (one per line) and exit. "
+            "For two_rooms, an optimizer is pending until both room files exist "
+            "(unless --room-idx selects a single room)."
         ),
     )
     parser.add_argument(
@@ -473,9 +648,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--room-idx",
         type=int,
-        default=0,
+        default=None,
         choices=(0, 1),
-        help="For two_rooms: which room's rate maps to fit (default: 0).",
+        help=(
+            "For two_rooms: fit only this room's rate maps. "
+            "When omitted, both rooms are fitted sequentially (room 0, then room 1)."
+        ),
     )
     parser.add_argument(
         "--n-gaussians",
@@ -511,6 +689,11 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute even when output fit files already exist.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable tqdm progress bars.",
@@ -523,20 +706,36 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--memory-split must be >= 1")
 
     workers = resolve_n_processes(args.n_processes, device=args.device)
+    if args.list_pending:
+        for tag in list_pending_optimizer_tags(
+            args.input,
+            experiment=args.experiment,
+            room_idx=args.room_idx,
+            optimizers=args.optimizers,
+            force=args.force,
+        ):
+            print(tag)
+        return
+
     if args.device == "cpu" and workers > 1 and not args.quiet:
         print(f"Using {workers} CPU worker processes")
 
-    out = run_estimate(
+    outputs = run_estimates(
         args.input,
         experiment=args.experiment,
         room_idx=args.room_idx,
+        optimizers=args.optimizers,
         n_gaussians=args.n_gaussians,
         memory_split=args.memory_split,
         device=args.device,
         n_processes=args.n_processes,
         show_progress=not args.quiet,
+        force=args.force,
     )
-    print(f"Wrote {out}")
+    for path in outputs:
+        print(f"Wrote {path}")
+    if not outputs:
+        print("No new fits written (all optimizers skipped or none found).")
 
 
 if __name__ == "__main__":

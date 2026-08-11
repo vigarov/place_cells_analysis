@@ -1,7 +1,6 @@
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
 
 from experiments.common.config import (
     ExperimentConfig,
@@ -13,6 +12,7 @@ from experiments.common.config import (
     config_subsection,
     require_config_dict,
 )
+from experiments.common.optimizers_config import load_optimizers_from_config_json
 from models.utils import RaeModelConfig, rae_model_config_from_dict
 
 
@@ -48,13 +48,13 @@ class SingleRoomConfig(ExperimentConfig):
 @dataclass
 class SingleRoomRunConfig:
     single_room: SingleRoomConfig
-    optimizer: dict[str, Any] = field(default_factory=lambda: {"type": "adam"})
+    optimizers: list[str] = field(default_factory=lambda: ["adam"])
 
 
 def load_single_room_experiment_config(path: Path | str) -> SingleRoomRunConfig:
     """
     Sections: `single_room` (with nested `room`, `trajectories`, `warmup`,
-    `training`), `model`, `optimizer`.
+    `training`), `model`, `optimizers`.
     """
     # import here to avoid circular import
     from experiments.single_room.experiment import SINGLE_ROOM_NAME
@@ -79,7 +79,5 @@ def load_single_room_experiment_config(path: Path | str) -> SingleRoomRunConfig:
     )
     config = replace(config, model=rae_model_config_from_dict(config_json.get("model", {})))
 
-    optimizer = require_config_dict(
-        config_json.get("optimizer", {"type": "adam"}), label="'optimizer'", path=str(path)
-    )
-    return SingleRoomRunConfig(single_room=config, optimizer=dict(optimizer))
+    optimizers = load_optimizers_from_config_json(config_json, path=path)
+    return SingleRoomRunConfig(single_room=config, optimizers=optimizers)

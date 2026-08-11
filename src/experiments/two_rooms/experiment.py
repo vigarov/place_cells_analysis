@@ -198,6 +198,19 @@ def run_two_rooms_experiment(
     run_config: TwoRoomsRunConfig,
     *,
     show_progress_level: int | None = None,
+    source_config_path: Path | None = None,
 ) -> ExperimentPaths:
-    experiment = TwoRoomsExperiment(run_config.two_rooms, run_config.optimizer)
-    return run_experiment(experiment, show_progress_level=show_progress_level)
+    from experiments.common.run import ExperimentRunConfig, create_experiment
+
+    experiment_run_config = ExperimentRunConfig(
+        experiment_type=TWO_ROOMS_NAME,
+        config=run_config.two_rooms,
+        optimizers=run_config.optimizers,
+    )
+    experiment = create_experiment(experiment_run_config)
+    return run_experiment(
+        experiment,
+        show_progress_level=show_progress_level,
+        source_config_path=source_config_path,
+        experiment_type=TWO_ROOMS_NAME,
+    )

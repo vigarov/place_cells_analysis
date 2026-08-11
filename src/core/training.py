@@ -1,6 +1,9 @@
 """RAE training and room experiments"""
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
+import json
 from typing import Any
 
 import numpy as np
@@ -245,10 +248,53 @@ def _print_plan_estimate(experiment: RoomExperiment, rooms, protocol) -> None:
     )
 
 
+def _json_safe(value: Any) -> Any:
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _write_run_config_json(
+    path: Path,
+    payload: dict[str, Any],
+) -> None:
+    path.write_text(json.dumps(_json_safe(payload), indent=2) + "\n")
+
+
+def _build_run_config_payload(
+    experiment: RoomExperiment,
+    *,
+    source_config_path: Path | None,
+    experiment_type: str | None,
+    started_at: str,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "source_config": str(source_config_path.resolve()) if source_config_path else None,
+        "experiment_type": experiment_type or experiment.name,
+        "optimizer": dict(experiment.optimizer_config),
+        "experiment_config": asdict(experiment.config),
+        "started_at": started_at,
+    }
+    if completed_at is not None:
+        payload["completed_at"] = completed_at
+    return payload
+
+
 def run_experiment(
     experiment: RoomExperiment,
     *,
     show_progress_level: int | None = None,
+    source_config_path: Path | None = None,
+    experiment_type: str | None = None,
 ) -> ExperimentPaths:
     """Run warmup + main training for a room-based experiment."""
     # import here to avoid circular imports
@@ -263,6 +309,18 @@ def run_experiment(
     device = config.resolve_device()
     paths = experiment.resolve_paths()
     paths.mkdirs()
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    config_json_path = paths.results_dir / "config.json"
+    _write_run_config_json(
+        config_json_path,
+        _build_run_config_payload(
+            experiment,
+            source_config_path=source_config_path,
+            experiment_type=experiment_type,
+            started_at=started_at,
+        ),
+    )
 
     rooms = experiment.load_rooms()
     protocol = experiment.build_protocol()
@@ -415,6 +473,16 @@ def run_experiment(
     progress.close()
 
     torch.save({"rae": rae.state_dict()}, paths.ckpt_dir / "final.pth")
+    _write_run_config_json(
+        config_json_path,
+        _build_run_config_payload(
+            experiment,
+            source_config_path=source_config_path,
+            experiment_type=experiment_type,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
     if show_progress_level >= 1:
         tqdm.write(f"Done. Results in {paths.results_dir}")
     return paths

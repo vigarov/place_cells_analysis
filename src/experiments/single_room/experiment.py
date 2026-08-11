@@ -168,6 +168,19 @@ def run_single_room_experiment(
     run_config: SingleRoomRunConfig,
     *,
     show_progress_level: int | None = None,
+    source_config_path: Path | None = None,
 ) -> ExperimentPaths:
-    experiment = SingleRoomExperiment(run_config.single_room, run_config.optimizer)
-    return run_experiment(experiment, show_progress_level=show_progress_level)
+    from experiments.common.run import ExperimentRunConfig
+
+    experiment_run_config = ExperimentRunConfig(
+        experiment_type=SINGLE_ROOM_NAME,
+        config=run_config.single_room,
+        optimizers=run_config.optimizers,
+    )
+    experiment = create_experiment(experiment_run_config)
+    return run_experiment(
+        experiment,
+        show_progress_level=show_progress_level,
+        source_config_path=source_config_path,
+        experiment_type=SINGLE_ROOM_NAME,
+    )
