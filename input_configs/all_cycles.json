@@ -16,6 +16,7 @@
     "mask_rate": 0.5,
     "schedule_seed": 3003,
     "mask_rng_seed": 3003,
+    "init_seed": 3003,
     "record_n_segments": null,
     "device": null,
     "gradient_clip_max": 10,

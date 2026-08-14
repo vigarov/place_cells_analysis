@@ -42,12 +42,12 @@
     "training": {
       "train_step_size_s": 20.0,
       "n_hidden": 1000,
-      "learning_rate": 0.001,
       "lambda_mse": 90.96,
       "lambda_fr": 116.6,
       "mask_rate": 0.4176,
       "mask_method": "cell",
       "mask_rng_seed": 3003,
+      "init_seed": 3003,
       "gradient_clip_max": 10,
       "carry_state": false,
       "capture_every_n_segments": 1,
@@ -55,7 +55,7 @@
       "record_n_eval_segments": null,
       "device": null
     },
-    "n_repetitions": 3
+    "n_repetitions": 4
   },
-  "optimizers": "all"
+  "optimizers": "adagrad"
 }
