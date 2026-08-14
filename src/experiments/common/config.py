@@ -53,12 +53,12 @@ class TrainingConfig(ABC):
 
     train_step_size_s: float = 10.0
     n_hidden: int = 1000
-    learning_rate: float = 1e-3
     lambda_mse: float = 1.0
     lambda_fr: float = 200.0
     mask_rate: float = 0.5
     mask_method: MaskMethod = "cell"
     mask_rng_seed: int = 3003
+    init_seed: int = 3003
     gradient_clip_max: float | None = None
     carry_state: bool = False
     capture_every_n_segments: int = 1

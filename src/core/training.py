@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import json
+import math
 from typing import Any
 
 import numpy as np
@@ -23,7 +24,7 @@ from experiments.common.ratemaps_io import (
     trajectory_ratemap_path,
 )
 from models.custom_learnable_activation import custom_ab_reg_loss
-from models.utils import build_rae, build_tracked_units, order_node_ids
+from models.utils import build_rae, build_tracked_units, order_node_ids, seed_model_init
 from optimizers import optimizer_extractor_from_dict
 from optimizers.base import OptimizerSignalExtractor
 
@@ -38,6 +39,15 @@ def unif_loss(states: torch.Tensor) -> torch.Tensor:
     return torch.pow(1.0 - std_fr, 2).mean()
 
 
+def weight_l2_reg_loss(rae: torch.nn.Module) -> torch.Tensor:
+    """Mean squared L2 over trainable parameters (per-parameter mean, then averaged)."""
+    parts = [p.square().mean() for p in rae.parameters() if p.requires_grad]
+    if not parts:
+        device = next(rae.parameters()).device
+        return torch.tensor(0.0, device=device)
+    return torch.stack(parts).mean()
+
+
 @dataclass
 class TrainConfig:
     """Hyperparameters for episodic RAE training."""
@@ -47,10 +57,10 @@ class TrainConfig:
     step_size: int = 20
     lambda_mse: float = 1.0
     lambda_fr: float = 200.0
-    learning_rate: float = 5e-4
     gradient_clip_max: float | None = None
     lambda_ab: float = 0.0 # ! experimental, leave 0/unused for current experiments
     lambda_unif: float = 0.0 # ! experimental, leave 0/unused for current experiments
+    lambda_weight: float = 0.0 # ! experimental, leave 0/unused for current experiments
     # True <=> the ending hidden state of one segment is propagated to the initial state of the next segment of tBPTT
     # /!\ changes behavior of training
     carry_state: bool = False
@@ -64,6 +74,57 @@ class SegmentResult:
     final_state: torch.Tensor | None = None  # (B, H), detached; set iff carry_state
     gradient_signals: StepGradientSignals | None = None
     optimizer_signals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    weight_snapshots: dict[str, np.ndarray] = field(default_factory=dict)
+    shampoo_blocks: dict[str, np.ndarray] = field(default_factory=dict)
+
+
+def model_has_nonfinite(rae: torch.nn.Module) -> bool:
+    """Return True when any model parameter is non-finite."""
+    for param in rae.parameters():
+        if not torch.isfinite(param).all():
+            return True
+    return False
+
+
+def tensor_has_nonfinite(tensor: torch.Tensor) -> bool:
+    """Return True when any element of a tensor is non-finite."""
+    return not torch.isfinite(tensor).all()
+
+
+def forward_has_nonfinite(
+    rae: torch.nn.Module,
+    pred: torch.Tensor,
+    h: torch.Tensor,
+    loss: torch.Tensor,
+) -> bool:
+    """Return True when the forward pass produced non-finite values."""
+    if not torch.isfinite(loss):
+        return True
+    if tensor_has_nonfinite(pred) or tensor_has_nonfinite(h):
+        return True
+    return model_has_nonfinite(rae)
+
+
+def segment_has_nonfinite(result: SegmentResult) -> bool:
+    """Return True when a segment loss is non-finite."""
+    return not math.isfinite(result.loss)
+
+
+def _is_numerical_optimizer_failure(exc: BaseException) -> bool:
+    """Return True when an optimizer step failed due to NaN/Inf divergence."""
+    if type(exc).__qualname__ == "PreconditionerValueError":
+        return True
+    message = str(exc).casefold()
+    return "nan" in message or "inf" in message
+
+
+def _capture_weight_snapshots(model: torch.nn.Module) -> dict[str, np.ndarray]:
+    """Return full post-step weights as `weight__<param_name>` float32 arrays."""
+    snapshots: dict[str, np.ndarray] = {}
+    for name, param in model.named_parameters():
+        safe = name.replace(".", "__")
+        snapshots[f"weight__{safe}"] = param.detach().float().cpu().numpy()
+    return snapshots
 
 
 def train_one_segment(
@@ -78,6 +139,7 @@ def train_one_segment(
     init_state: torch.Tensor | None = None,
     capture_gradients: bool = False,
     extractor: OptimizerSignalExtractor | None = None,
+    abort_on_nan: bool = False,
 ) -> SegmentResult:
     """Run exactly one truncated-BPTT gradient update on one pre-sliced chunk.
 
@@ -111,6 +173,15 @@ def train_one_segment(
         loss = loss + unif_loss(h) * config.lambda_unif
     if config.lambda_ab > 0:
         loss = loss + config.lambda_ab * custom_ab_reg_loss(rae)
+    if config.lambda_weight > 0:
+        loss = loss + config.lambda_weight * weight_l2_reg_loss(rae)
+
+    if abort_on_nan and forward_has_nonfinite(rae, pred, h, loss):
+        loss_value = float(loss.detach().item())
+        if not math.isfinite(loss_value):
+            loss_value = float("nan")
+        return SegmentResult(loss=loss_value)
+
     loss.backward()
 
     gradient_signals = None
@@ -131,10 +202,20 @@ def train_one_segment(
 
     if config.gradient_clip_max is not None:
         torch.nn.utils.clip_grad_norm_(rae.parameters(), config.gradient_clip_max)
-    optimizer.step()
+    try:
+        optimizer.step()
+    except Exception as exc:
+        if abort_on_nan and _is_numerical_optimizer_failure(exc):
+            loss_value = float(loss.detach().item())
+            if not math.isfinite(loss_value):
+                loss_value = float("nan")
+            return SegmentResult(loss=loss_value)
+        raise
 
+    shampoo_blocks: dict[str, np.ndarray] = {}
     if extractor is not None:
         optimizer_signals.update(extractor.on_after_step(rae, optimizer))
+        shampoo_blocks = extractor.on_after_step_shampoo_blocks(rae, optimizer)
 
     final_state = h[:, -1, :].detach().clone() if config.carry_state else None
 
@@ -143,6 +224,8 @@ def train_one_segment(
         final_state=final_state,
         gradient_signals=gradient_signals,
         optimizer_signals=optimizer_signals,
+        weight_snapshots=_capture_weight_snapshots(rae),
+        shampoo_blocks=shampoo_blocks,
     )
 
 
@@ -159,8 +242,14 @@ def train_trajectory_segments(
     extractor: OptimizerSignalExtractor | None = None,
     on_segment: Callable[[int, int, SegmentResult], None] | None = None,
     segment_progress: tqdm | None = None,
-) -> None:
-    """Train all truncated-BPTT segments of one `(B, T, 2)` trajectory chunk."""
+    abort_on_nan: bool = False,
+) -> bool:
+    """Train all truncated-BPTT segments of one `(B, T, 2)` trajectory chunk.
+
+    Returns False when `abort_on_nan` is set and non-finite values appear in the
+    forward pass (before backward), after an optimizer step, or when an optimizer
+    step raises a numerical failure (e.g. Shampoo preconditioner NaN).
+    """
     n_segments = tc_full.shape[1] // config.step_size
     state: torch.Tensor | None = None
     for seg_idx in range(n_segments):
@@ -176,13 +265,19 @@ def train_trajectory_segments(
             init_state=state if config.carry_state else None,
             capture_gradients=capture_gradients,
             extractor=extractor,
+            abort_on_nan=abort_on_nan,
         )
+        if abort_on_nan and (
+            segment_has_nonfinite(result) or model_has_nonfinite(rae)
+        ):
+            return False
         if on_segment is not None:
             on_segment(seg_idx, n_segments, result)
         if segment_progress is not None:
             segment_progress.update(1)
         if config.carry_state:
             state = result.final_state
+    return True
 
 
 def _train_config(experiment: RoomExperiment, step_size: int) -> TrainConfig:
@@ -193,7 +288,6 @@ def _train_config(experiment: RoomExperiment, step_size: int) -> TrainConfig:
         step_size=step_size,
         lambda_mse=training.lambda_mse,
         lambda_fr=training.lambda_fr,
-        learning_rate=training.learning_rate,
         gradient_clip_max=training.gradient_clip_max,
         carry_state=training.carry_state,
     )
@@ -216,6 +310,8 @@ def _save_segment_signals(
 
     payload["opt_signals"] = np.array([result.optimizer_signals], dtype=object)
     payload["node_ids"] = np.array(node_ids)
+    payload.update(result.weight_snapshots)
+    payload.update(result.shampoo_blocks)
 
     np.savez_compressed(traj_dir / f"segment_{seg_idx}.npz", **payload)
 
@@ -328,6 +424,7 @@ def run_experiment(
     capture_frequency = experiment.ratemap_capture()
     _print_plan_estimate(experiment, rooms, protocol)
 
+    seed_model_init(config.training.init_seed)
     rae = build_rae(
         config.room.n_wsm_cells,
         config.training.n_hidden,

@@ -62,7 +62,6 @@ class GraftedShampooExtractor(OptimizerSignalExtractor):
         self.betas = betas
         self.shampoo_preconditioner_epsilon = shampoo_preconditioner_epsilon
         self.grafting_eps = grafting_eps
-        self._pending_block_signals: dict[str, np.ndarray] = {}
 
     def optimizer_id(self) -> str:
         return f"grafted_shampoo_lr{self.lr}"
@@ -157,9 +156,6 @@ class GraftedShampooExtractor(OptimizerSignalExtractor):
         self, model: nn.Module, optimizer: torch.optim.Optimizer,
     ) -> dict[str, Any]:
         assert isinstance(optimizer, DistributedShampoo)
-        self._pending_block_signals = _extract_h_inv_blocks(
-            optimizer, model, units=self._units,
-        )
         return {
             "h_inv_norm": _compute_h_inv_norms_by_unit(
                 optimizer, model, self._units,
@@ -170,4 +166,5 @@ class GraftedShampooExtractor(OptimizerSignalExtractor):
     def on_after_step_shampoo_blocks(
         self, model: nn.Module, optimizer: torch.optim.Optimizer,
     ) -> dict[str, np.ndarray]:
-        return dict(self._pending_block_signals)
+        assert isinstance(optimizer, DistributedShampoo)
+        return _extract_h_inv_blocks(optimizer, model, units=None)

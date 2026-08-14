@@ -1,8 +1,16 @@
 """Parse `optimizers` from room experiment input config JSON."""
+import json
 from pathlib import Path
 from typing import Any
 
 from optimizers.defaults import OPTIMIZER_SHORTHAND_TO_CLASS
+
+
+def raw_optimizers_value(config_path: Path | str) -> Any:
+    """Return the raw top-level `optimizers` value from a config JSON file."""
+    path = Path(config_path)
+    payload = json.loads(path.read_text())
+    return payload.get("optimizers", "adam")
 
 
 def parse_optimizers(raw: Any, *, path: Path | str) -> list[str]:

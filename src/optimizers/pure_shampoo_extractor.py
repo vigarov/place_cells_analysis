@@ -156,7 +156,6 @@ class PureShampooExtractor(OptimizerSignalExtractor):
         self.lr = lr
         self.betas = betas
         self.shampoo_preconditioner_epsilon = shampoo_preconditioner_epsilon
-        self._pending_block_signals: dict[str, np.ndarray] = {}
 
     def optimizer_id(self) -> str:
         return f"pure_shampoo_lr{self.lr}"
@@ -198,9 +197,6 @@ class PureShampooExtractor(OptimizerSignalExtractor):
         self, model: nn.Module, optimizer: torch.optim.Optimizer,
     ) -> dict[str, dict[str, float]]:
         assert isinstance(optimizer, DistributedShampoo)
-        self._pending_block_signals = _extract_h_inv_blocks(
-            optimizer, model, units=self._units,
-        )
         return {
             "h_inv_norm": _compute_h_inv_norms_by_unit(
                 optimizer, model, self._units,
@@ -210,4 +206,5 @@ class PureShampooExtractor(OptimizerSignalExtractor):
     def on_after_step_shampoo_blocks(
         self, model: nn.Module, optimizer: torch.optim.Optimizer,
     ) -> dict[str, np.ndarray]:
-        return dict(self._pending_block_signals)
+        assert isinstance(optimizer, DistributedShampoo)
+        return _extract_h_inv_blocks(optimizer, model, units=None)

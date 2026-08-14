@@ -80,9 +80,7 @@ def create_experiment(
     """Instantiate the experiment driver for a loaded run configuration."""
     if optimizer_config is None:
         opt_type = run_config.optimizers[0]
-        optimizer_config = build_optimizer_config(
-            opt_type, run_config.config.training.learning_rate
-        )
+        optimizer_config = build_optimizer_config(opt_type)
     optimizer_tag = optimizer_tag_from_config(optimizer_config)
 
     experiment_type = run_config.experiment_type

@@ -4,7 +4,8 @@ Bayesian hyperparameter optimization for room-based experiments.
 Two variants -- normal RNN, or RNN with learnable activation function: 
 
 Variant A: ReLU RAE; tunes lambda_mse, lambda_fr, mask_rate, gradient_clip_max, alpha.
-Variant B: custom activation RAE; same plus lambda_ab; 
+Variant B: custom activation RAE; same plus lambda_ab;
+Variant C: BumpActivation RAE; training hyperparams fixed from config; tunes nl, nr, s (nr > nl); 
 
 Each trial runs full warmup plus two training epochs, then evaluates on held-out
 trajectories and saves ratemaps. Log train and eval-set MSE autoencoding error.
@@ -20,9 +21,13 @@ Usage::
     uv run generate-experiment-room --config input_configs/single_room.json
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant a --n-trials 30
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant b --n-trials 30
-    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant b --n-trials 30 --parallel-trials 2
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant c --n-trials 30
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --lr-only --n-trials 20
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant b --ab-only --n-trials 20
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --lr-only --exclude-opt sgd --n-trials 20
 """
 import argparse
+import copy
 import csv
 import json
 import shutil
@@ -43,12 +48,16 @@ from core.hyperparam_trial import (
     MAX_FR_FACTOR,
     BoVariant,
     apply_trial_params,
+    bo_parameter_constraints,
     estimate_trial_segments,
+    fixed_trial_params,
     lambda_fr_mse_parameter_constraints,
     run_hyperparam_trial,
     search_bounds_from_config,
 )
-from experiments.common.run import create_experiment, load_experiment_config
+from experiments.common.optimizers_config import parse_optimizers, raw_optimizers_value
+from experiments.common.run import ExperimentRunConfig, create_experiment, load_experiment_config
+from optimizers.defaults import OPTIMIZER_SHORTHAND_TO_CLASS
 
 ACTIVITY_FRACTION_LO = ACTIVITY_TARGET - 0.3
 ACTIVITY_FRACTION_HI = ACTIVITY_TARGET + 0.2
@@ -59,6 +68,7 @@ TRIAL_METRIC_FIELDS = [
     "loss",
     "train_error",
     "eval_error",
+    "aborted_nan",
 ]
 
 VARIANT_B_METRIC_FIELDS = [
@@ -66,6 +76,13 @@ VARIANT_B_METRIC_FIELDS = [
     "activation_a_sem",
     "activation_b_mean",
     "activation_b_sem",
+]
+
+VARIANT_C_METRIC_FIELDS = [
+    "activation_A_mean",
+    "activation_A_sem",
+    "activation_m_mean",
+    "activation_m_sem",
 ]
 
 TRIALS_CSV_FIELDS_A = [
@@ -94,6 +111,17 @@ TRIALS_CSV_FIELDS_B = [
     "ratemap_path",
 ]
 
+TRIALS_CSV_FIELDS_C = [
+    "trial_index",
+    "timestamp",
+    "nl",
+    "nr",
+    "s",
+    *TRIAL_METRIC_FIELDS,
+    *VARIANT_C_METRIC_FIELDS,
+    "ratemap_path",
+]
+
 
 def _parse_bounds(value: str, name: str) -> tuple[float, float]:
     parts = [p.strip() for p in value.split(",")]
@@ -108,12 +136,59 @@ def _parse_bounds(value: str, name: str) -> tuple[float, float]:
     return low, high
 
 
-def _default_output_dir(experiment_type: str, variant: BoVariant) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return Path("results") / "hyperparam_opt" / experiment_type / f"variant_{variant}_{stamp}"
+def _default_output_dir(
+    experiment_type: str,
+    variant: BoVariant,
+    *,
+    optimizer: str | None = None,
+    stamp: str | None = None,
+) -> Path:
+    stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if optimizer is not None:
+        run_name = f"variant_{variant}_{optimizer}_{stamp}"
+    else:
+        run_name = f"variant_{variant}_{stamp}"
+    return Path("results") / "hyperparam_opt" / experiment_type / run_name
 
 
-def _trials_csv_fields(variant: BoVariant) -> list[str]:
+def _trials_csv_fields(
+    variant: BoVariant, *, lr_only: bool = False, ab_only: bool = False
+) -> list[str]:
+    if lr_only:
+        fields = [
+            "trial_index",
+            "timestamp",
+            "learning_rate",
+            "lambda_mse",
+            "lambda_fr",
+            "gradient_clip_max",
+            "mask_rate",
+            "alpha",
+        ]
+        if variant == "b":
+            fields.append("lambda_ab")
+        fields.extend(TRIAL_METRIC_FIELDS)
+        if variant == "b":
+            fields.extend(VARIANT_B_METRIC_FIELDS)
+        fields.append("ratemap_path")
+        return fields
+    if ab_only:
+        fields = [
+            "trial_index",
+            "timestamp",
+            "lambda_ab",
+            "lambda_mse",
+            "lambda_fr",
+            "gradient_clip_max",
+            "mask_rate",
+            "alpha",
+            *TRIAL_METRIC_FIELDS,
+            *VARIANT_B_METRIC_FIELDS,
+            "ratemap_path",
+        ]
+        return fields
+    if variant == "c":
+        return TRIALS_CSV_FIELDS_C
     return TRIALS_CSV_FIELDS_B if variant == "b" else TRIALS_CSV_FIELDS_A
 
 
@@ -121,14 +196,15 @@ def _ax_parameters(bounds: dict[str, Any]) -> list[dict[str, Any]]:
     parameters: list[dict[str, Any]] = []
     for name, bound in bounds.items():
         low, high = bound
-        parameters.append(
-            {
-                "name": name,
-                "type": "range",
-                "bounds": [low, high],
-                "value_type": "float",
-            }
-        )
+        spec: dict[str, Any] = {
+            "name": name,
+            "type": "range",
+            "bounds": [low, high],
+            "value_type": "float",
+        }
+        if name == "learning_rate":
+            spec["log_scale"] = True
+        parameters.append(spec)
     return parameters
 
 
@@ -222,17 +298,22 @@ def _create_ax_client(
     sobol_trials: int,
     use_lambda_fr_constraint: bool,
     optimize_error: bool,
+    optimizer: str | None = None,
 ) -> AxClient:
     objectives, outcome_constraints, tracking_metric_names = _ax_setup(
         optimize_error=optimize_error
     )
-    parameter_constraints = lambda_fr_mse_parameter_constraints(
+    parameter_constraints = bo_parameter_constraints(
+        variant=variant,
         enabled=use_lambda_fr_constraint,
         bounds=bounds,
     )
+    experiment_name = f"hyperparam_{experiment_type}_variant_{variant}"
+    if optimizer is not None:
+        experiment_name = f"{experiment_name}_{optimizer}"
     ax_client = AxClient(random_seed=random_seed, verbose_logging=True)
     ax_client.create_experiment(
-        name=f"hyperparam_{experiment_type}_variant_{variant}",
+        name=experiment_name,
         parameters=_ax_parameters(bounds),
         objectives=objectives,
         parameter_constraints=parameter_constraints or None,
@@ -295,6 +376,9 @@ def _write_run_meta(
     bounds: dict[str, Any],
     use_lambda_fr_constraint: bool,
     optimize_error: bool,
+    lr_only: bool = False,
+    ab_only: bool = False,
+    optimizer: str | None = None,
     migrated_from: Path | None = None,
 ) -> None:
     meta: dict[str, Any] = {
@@ -303,14 +387,19 @@ def _write_run_meta(
         "bounds": {k: list(v) for k, v in bounds.items()},
         "objectives": sorted(_current_objective_names(optimize_error=optimize_error)),
         "lambda_fr_constraint": use_lambda_fr_constraint,
-        "parameter_constraints": lambda_fr_mse_parameter_constraints(
+        "parameter_constraints": bo_parameter_constraints(
+            variant=variant,
             enabled=use_lambda_fr_constraint,
             bounds=bounds,
         ),
         "optimize_error": optimize_error,
+        "lr_only": lr_only,
+        "ab_only": ab_only,
         "max_fr_factor": MAX_FR_FACTOR,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if optimizer is not None:
+        meta["optimizer"] = optimizer
     if migrated_from is not None:
         meta["migrated_from"] = str(migrated_from.resolve())
         meta["migrated_at"] = datetime.now(timezone.utc).isoformat()
@@ -327,9 +416,16 @@ def _load_run_meta(output_dir: Path) -> dict[str, Any]:
     return json.loads(meta_path.read_text())
 
 
-def _append_trial_csv(output_dir: Path, row: dict[str, Any], *, variant: BoVariant) -> None:
+def _append_trial_csv(
+    output_dir: Path,
+    row: dict[str, Any],
+    *,
+    variant: BoVariant,
+    lr_only: bool = False,
+    ab_only: bool = False,
+) -> None:
     csv_path = output_dir / "trials.csv"
-    fieldnames = _trials_csv_fields(variant)
+    fieldnames = _trials_csv_fields(variant, lr_only=lr_only, ab_only=ab_only)
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -472,17 +568,35 @@ def _print_trial_summary(
     *,
     variant: BoVariant,
     optimize_error: bool,
+    lr_only: bool = False,
+    ab_only: bool = False,
+    optimizer: str | None = None,
 ) -> None:
-    print(f"\n=== Trial {trial_num}/{n_trials} (index {trial_index}) [variant {variant}] ===")
-    param_parts = [
-        f"lambda_mse={params['lambda_mse']:.4g}",
-        f"lambda_fr={params['lambda_fr']:.4g}",
-        f"gradient_clip_max={params['gradient_clip_max']:.4g}",
-        f"mask_rate={params['mask_rate']:.4g}",
-    ]
-    param_parts.append(f"alpha={params['alpha']:.4g}")
-    if variant == "b":
-        param_parts.append(f"lambda_ab={params['lambda_ab']:.4g}")
+    opt_label = f", optimizer={optimizer}" if optimizer is not None else ""
+    print(
+        f"\n=== Trial {trial_num}/{n_trials} (index {trial_index}) "
+        f"[variant {variant}{opt_label}] ==="
+    )
+    if lr_only:
+        param_parts = [f"learning_rate={params['learning_rate']:.4g}"]
+    elif ab_only:
+        param_parts = [f"lambda_ab={params['lambda_ab']:.4g}"]
+    elif variant == "c":
+        param_parts = [
+            f"nl={params['nl']:.4g}",
+            f"nr={params['nr']:.4g}",
+            f"s={params['s']:.4g}",
+        ]
+    else:
+        param_parts = [
+            f"lambda_mse={params['lambda_mse']:.4g}",
+            f"lambda_fr={params['lambda_fr']:.4g}",
+            f"gradient_clip_max={params['gradient_clip_max']:.4g}",
+            f"mask_rate={params['mask_rate']:.4g}",
+        ]
+        param_parts.append(f"alpha={params['alpha']:.4g}")
+        if variant == "b":
+            param_parts.append(f"lambda_ab={params['lambda_ab']:.4g}")
     print("Params:", ", ".join(param_parts))
     activity_fraction = metrics.get("activity_fraction", float("nan"))
     metric_parts = [
@@ -492,6 +606,8 @@ def _print_trial_summary(
         f"eval_error={metrics.get('eval_error', float('nan')):.4f}",
         f"loss={metrics['loss']:.4f}",
     ]
+    if metrics.get("aborted_nan", 0.0) >= 1.0:
+        metric_parts.append("aborted_nan=1")
     if variant == "b" and "activation_a_mean" in metrics:
         metric_parts.append(
             "a="
@@ -502,6 +618,17 @@ def _print_trial_summary(
             "b="
             f"{metrics['activation_b_mean']:.4g}"
             f"±{metrics.get('activation_b_sem', 0.0):.4g}"
+        )
+    if variant == "c" and "activation_A_mean" in metrics:
+        metric_parts.append(
+            "A="
+            f"{metrics['activation_A_mean']:.4g}"
+            f"±{metrics.get('activation_A_sem', 0.0):.4g}"
+        )
+        metric_parts.append(
+            "m="
+            f"{metrics['activation_m_mean']:.4g}"
+            f"±{metrics.get('activation_m_sem', 0.0):.4g}"
         )
     if "ratemap_path" in metrics:
         metric_parts.append(f"ratemap_path={metrics['ratemap_path']}")
@@ -533,18 +660,373 @@ def _print_trial_summary(
         )
 
 
-def _probe_params(base_config, *, variant: BoVariant) -> dict[str, Any]:
-    training = base_config.config.training
-    params: dict[str, Any] = {
-        "lambda_mse": training.lambda_mse,
-        "lambda_fr": training.lambda_fr,
-        "gradient_clip_max": training.gradient_clip_max or 10.0,
-        "mask_rate": training.mask_rate,
-    }
-    params["alpha"] = base_config.config.model.alpha
-    if variant == "b":
-        params["lambda_ab"] = training.lambda_fr / 100.0
-    return params
+def _probe_params(base_config: ExperimentRunConfig, *, variant: BoVariant) -> dict[str, Any]:
+    return fixed_trial_params(base_config, variant=variant)
+
+
+def _session_config(
+    base_config: ExperimentRunConfig,
+    optimizer: str | None,
+) -> ExperimentRunConfig:
+    if optimizer is None:
+        return base_config
+    session = copy.deepcopy(base_config)
+    session.optimizers = [optimizer]
+    return session
+
+
+def _resolve_output_dir(
+    *,
+    base_output_dir: Path | None,
+    experiment_type: str,
+    variant: BoVariant,
+    optimizer: str | None,
+    stamp: str,
+    multi_optimizer: bool,
+) -> Path:
+    if base_output_dir is None:
+        return _default_output_dir(
+            experiment_type,
+            variant,
+            optimizer=optimizer if multi_optimizer else None,
+            stamp=stamp,
+        )
+    if multi_optimizer and optimizer is not None:
+        return base_output_dir / optimizer
+    return base_output_dir
+
+
+def _run_bo_session(
+    *,
+    base_config: ExperimentRunConfig,
+    config_path: Path,
+    variant: BoVariant,
+    optimizer: str | None,
+    output_dir: Path,
+    n_trials: int,
+    resume_path: Path | None,
+    args: argparse.Namespace,
+    lr_only: bool,
+    ab_only: bool,
+    use_lambda_fr_constraint: bool,
+    optimize_error: bool,
+) -> None:
+    session_config = _session_config(base_config, optimizer)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise SystemExit(f"Resume file not found: {resume_path}")
+        source_dir = resume_path.parent
+        if output_dir.resolve() != source_dir.resolve():
+            output_dir.mkdir(parents=True, exist_ok=True)
+        run_meta = _load_run_meta(source_dir)
+        saved_variant = run_meta.get("variant")
+        if saved_variant != variant:
+            raise SystemExit(
+                f"Resume variant mismatch: run_meta.json has variant={saved_variant!r}, "
+                f"but --variant={variant!r}"
+            )
+        saved_lr_only = run_meta.get("lr_only", False)
+        if saved_lr_only != lr_only:
+            raise SystemExit(
+                f"Resume lr_only mismatch: run_meta.json has lr_only={saved_lr_only!r}, "
+                f"but current run has lr_only={lr_only!r}"
+            )
+        saved_ab_only = run_meta.get("ab_only", False)
+        if saved_ab_only != ab_only:
+            raise SystemExit(
+                f"Resume ab_only mismatch: run_meta.json has ab_only={saved_ab_only!r}, "
+                f"but current run has ab_only={ab_only!r}"
+            )
+        saved_optimizer = run_meta.get("optimizer")
+        if optimizer is not None and saved_optimizer not in (None, optimizer):
+            raise SystemExit(
+                f"Resume optimizer mismatch: run_meta.json has optimizer={saved_optimizer!r}, "
+                f"but current session uses optimizer={optimizer!r}"
+            )
+        bounds = {name: tuple(values) for name, values in run_meta["bounds"].items()}
+        param_names = list(bounds.keys())
+        saved_lambda_fr_constraint = run_meta.get("lambda_fr_constraint", False)
+        saved_optimize_error = run_meta.get("optimize_error", False)
+        current_parameter_constraints = bo_parameter_constraints(
+            variant=variant,
+            enabled=use_lambda_fr_constraint,
+            bounds=bounds,
+        )
+        saved_parameter_constraints = run_meta.get("parameter_constraints")
+        if saved_parameter_constraints is None:
+            if variant == "c":
+                saved_parameter_constraints = bo_parameter_constraints(
+                    variant=variant,
+                    bounds=bounds,
+                )
+            else:
+                legacy_bounds = {
+                    name: bound for name, bound in bounds.items() if name != "lambda_ab"
+                }
+                saved_parameter_constraints = lambda_fr_mse_parameter_constraints(
+                    enabled=saved_lambda_fr_constraint,
+                    bounds=legacy_bounds,
+                )
+        source_client = _load_ax_client(resume_path)
+
+        if (
+            _objectives_match(source_client, optimize_error=optimize_error)
+            and saved_lambda_fr_constraint == use_lambda_fr_constraint
+            and saved_optimize_error == optimize_error
+            and saved_parameter_constraints == current_parameter_constraints
+        ):
+            ax_client = source_client
+            completed = len(ax_client.get_trials_data_frame())
+            print(f"Resuming from {resume_path} ({completed} completed trials)")
+        else:
+            source_df = source_client.get_trials_data_frame()
+            n_source = len(
+                source_df[source_df["trial_status"] == "COMPLETED"]
+                if "trial_status" in source_df.columns
+                else source_df
+            )
+            if not _objectives_match(source_client, optimize_error=optimize_error):
+                old_objectives = sorted(_ax_objective_names(source_client))
+                new_objectives = sorted(
+                    _current_objective_names(optimize_error=optimize_error)
+                )
+                print(
+                    f"Objective mismatch ({old_objectives} -> {new_objectives}); "
+                    f"migrating {n_source} completed trials from {resume_path}"
+                )
+            elif saved_lambda_fr_constraint != use_lambda_fr_constraint:
+                print(
+                    "Parameter-constraint mismatch "
+                    f"(saved={saved_lambda_fr_constraint}, "
+                    f"current={use_lambda_fr_constraint}); "
+                    f"migrating {n_source} completed trials from {resume_path}"
+                )
+            elif saved_optimize_error != optimize_error:
+                print(
+                    "Objective-mode mismatch "
+                    f"(saved optimize_error={saved_optimize_error}, "
+                    f"current={optimize_error}); "
+                    f"migrating {n_source} completed trials from {resume_path}"
+                )
+            elif saved_parameter_constraints != current_parameter_constraints:
+                print(
+                    "Parameter-constraint mismatch "
+                    f"(saved={saved_parameter_constraints}, "
+                    f"current={current_parameter_constraints}); "
+                    f"migrating {n_source} completed trials from {resume_path}"
+                )
+            if output_dir.resolve() != source_dir.resolve():
+                _copy_run_artifacts(source_dir, output_dir)
+            ax_client = _create_ax_client(
+                experiment_type=session_config.experiment_type,
+                variant=variant,
+                bounds=bounds,
+                random_seed=args.random_seed,
+                sobol_trials=args.sobol_trials,
+                use_lambda_fr_constraint=use_lambda_fr_constraint,
+                optimize_error=optimize_error,
+                optimizer=optimizer,
+            )
+            completed = _attach_completed_trials(
+                ax_client,
+                source_df,
+                param_names,
+                optimize_error=optimize_error,
+            )
+            _write_run_meta(
+                output_dir,
+                variant=variant,
+                config_path=config_path,
+                bounds=bounds,
+                use_lambda_fr_constraint=use_lambda_fr_constraint,
+                optimize_error=optimize_error,
+                lr_only=lr_only,
+                ab_only=ab_only,
+                optimizer=optimizer,
+                migrated_from=resume_path,
+            )
+            ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
+            print(
+                f"Attached {completed} trials; continuing in {output_dir} "
+                f"from trial {completed + 1}"
+            )
+
+        start_trial = completed + 1
+    else:
+        bounds = search_bounds_from_config(
+            session_config,
+            variant=variant,
+            lr_only=lr_only,
+            ab_only=ab_only,
+            lambda_mse_bounds=args.lambda_mse_bounds,
+            lambda_fr_bounds=args.lambda_fr_bounds,
+            gradient_clip_bounds=args.gradient_clip_bounds,
+            lambda_ab_bounds=args.lambda_ab_bounds,
+            alpha_bounds=args.alpha_bounds,
+            nl_bounds=args.nl_bounds,
+            nr_bounds=args.nr_bounds,
+            s_bounds=args.s_bounds,
+            apply_ab_constraint=use_lambda_fr_constraint,
+        )
+        _write_run_meta(
+            output_dir,
+            variant=variant,
+            config_path=config_path,
+            bounds=bounds,
+            use_lambda_fr_constraint=use_lambda_fr_constraint,
+            optimize_error=optimize_error,
+            lr_only=lr_only,
+            ab_only=ab_only,
+            optimizer=optimizer,
+        )
+        ax_client = _create_ax_client(
+            experiment_type=session_config.experiment_type,
+            variant=variant,
+            bounds=bounds,
+            random_seed=args.random_seed,
+            sobol_trials=args.sobol_trials,
+            use_lambda_fr_constraint=use_lambda_fr_constraint,
+            optimize_error=optimize_error,
+            optimizer=optimizer,
+        )
+        ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
+        start_trial = 1
+
+        probe_params = _probe_params(session_config, variant=variant)
+        probe_config = apply_trial_params(
+            session_config,
+            probe_params,
+            variant=variant,
+            lr_only=lr_only,
+            ab_only=ab_only,
+        )
+        probe_experiment = create_experiment(probe_config)
+        probe_rooms = probe_experiment.load_rooms()
+        n_segments = estimate_trial_segments(probe_experiment, probe_rooms)
+        if session_config.experiment_type == "single_room":
+            n_epochs = probe_config.config.n_epochs
+            training_unit = f"{n_epochs} epoch{'s' if n_epochs != 1 else ''}"
+        elif session_config.experiment_type == "two_rooms":
+            training_unit = "1 repetition"
+        else:
+            training_unit = "1 cycle"
+        opt_label = f", optimizer={optimizer}" if optimizer is not None else ""
+        if lr_only:
+            mode_label = "lr-only"
+        elif ab_only:
+            mode_label = "ab-only"
+        elif variant == "c":
+            mode_label = "bump-shape"
+        else:
+            mode_label = "full"
+        print(
+            f"[{session_config.experiment_type}] variant {variant} ({mode_label}{opt_label}): "
+            f"each trial warmup + {training_unit} (~{n_segments} TBPTT segments). "
+            f"Output: {output_dir}"
+        )
+        print("Search bounds:", json.dumps(bounds, indent=2, default=list))
+        objectives, outcome_constraints, tracking_metrics = _ax_setup(
+            optimize_error=optimize_error
+        )
+        parameter_constraints = bo_parameter_constraints(
+            variant=variant,
+            enabled=use_lambda_fr_constraint,
+            bounds=bounds,
+        )
+        print("Objectives:", ", ".join(objectives))
+        print("Tracking metrics:", tracking_metrics or "none")
+        print("Outcome constraints:", outcome_constraints or "none")
+        print(
+            "Parameter constraints:",
+            parameter_constraints or "none",
+        )
+
+    if start_trial > n_trials:
+        print(f"All {n_trials} trials already completed.")
+        return
+
+    fixed_params = fixed_trial_params(session_config, variant=variant)
+
+    def _run_one_trial(
+        trial_index: int, params: dict[str, Any]
+    ) -> tuple[int, dict[str, Any], dict[str, float]]:
+        trial_config = apply_trial_params(
+            session_config,
+            params,
+            variant=variant,
+            lr_only=lr_only,
+            ab_only=ab_only,
+        )
+        metrics = run_hyperparam_trial(
+            trial_config,
+            params,
+            variant=variant,
+            trial_index=trial_index,
+            output_dir=output_dir,
+            show_progress=args.show_progress,
+        )
+        if lr_only or ab_only or variant == "c":
+            merged_params = {**fixed_params, **params}
+        else:
+            merged_params = params
+        return trial_index, merged_params, metrics
+
+    trial_num = start_trial
+    while trial_num <= n_trials:
+        batch_size = min(args.parallel_trials, n_trials - trial_num + 1)
+        trials, _ = ax_client.get_next_trials(max_trials=batch_size)
+
+        if batch_size == 1:
+            trial_index, params = next(iter(trials.items()))
+            completed = [_run_one_trial(trial_index, params)]
+        else:
+            completed = []
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                futures = {
+                    executor.submit(_run_one_trial, trial_index, params): trial_index
+                    for trial_index, params in trials.items()
+                }
+                for future in as_completed(futures):
+                    completed.append(future.result())
+            completed.sort(key=lambda row: row[0])
+
+        for trial_index, params, metrics in completed:
+            ax_client.complete_trial(
+                trial_index=trial_index,
+                raw_data=_ax_raw_data(metrics, optimize_error=optimize_error),
+            )
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+            row = {
+                "trial_index": trial_index,
+                "timestamp": timestamp,
+                **params,
+                **metrics,
+            }
+            _append_trial_csv(
+                output_dir, row, variant=variant, lr_only=lr_only, ab_only=ab_only
+            )
+            _print_trial_summary(
+                trial_num,
+                n_trials,
+                trial_index,
+                params,
+                metrics,
+                ax_client,
+                variant=variant,
+                optimize_error=optimize_error,
+                lr_only=lr_only,
+                ab_only=ab_only,
+                optimizer=optimizer,
+            )
+            trial_num += 1
+
+        ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
+        _write_summary(output_dir, ax_client, optimize_error=optimize_error)
+
+    print(f"\nDone. Results in {output_dir}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -559,9 +1041,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--variant",
-        choices=("a", "b"),
+        choices=("a", "b", "c"),
         default="a",
-        help="BO variant: a=ReLU RAE, b=custom activation RAE (default: a)",
+        help=(
+            "BO variant: a=ReLU RAE, b=custom activation RAE, "
+            "c=BumpActivation RAE (default: a)"
+        ),
     )
     parser.add_argument("--n-trials", type=int, default=30, help="Total BO trials to run")
     parser.add_argument(
@@ -618,6 +1103,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Override alpha search bounds as 'low,high'",
     )
     parser.add_argument(
+        "--nl-bounds",
+        type=lambda s: _parse_bounds(s, "nl"),
+        default=None,
+        help="Override nl search bounds as 'low,high' (variant C only)",
+    )
+    parser.add_argument(
+        "--nr-bounds",
+        type=lambda s: _parse_bounds(s, "nr"),
+        default=None,
+        help="Override nr search bounds as 'low,high' (variant C only)",
+    )
+    parser.add_argument(
+        "--s-bounds",
+        type=lambda s: _parse_bounds(s, "s"),
+        default=None,
+        help="Override s search bounds as 'low,high' (variant C only)",
+    )
+    parser.add_argument(
         "--show-progress",
         action="store_true",
         help="Show warmup trajectory progress bars during each trial",
@@ -648,6 +1151,27 @@ def main(argv: list[str] | None = None) -> None:
             "still logs loss and eval_error."
         ),
     )
+    parser.add_argument(
+        "--lr-only",
+        action="store_true",
+        help="Tune only optimizer lr in [1e-5, 0.1] (log scale); fix other hyperparams from config.",
+    )
+    parser.add_argument(
+        "--ab-only",
+        action="store_true",
+        help=(
+            "Variant B only: tune only lambda_ab; fix other hyperparams from config."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-opt",
+        choices=sorted(OPTIMIZER_SHORTHAND_TO_CLASS),
+        default=None,
+        help=(
+            "Skip one optimizer when the config lists multiple optimizers "
+            "(or optimizers: all). Remaining optimizers each get their own BO session."
+        ),
+    )
     args = parser.parse_args(argv)
     variant: BoVariant = args.variant
 
@@ -660,6 +1184,63 @@ def main(argv: list[str] | None = None) -> None:
     if not args.config.is_file():
         raise SystemExit(f"Config file not found: {args.config}")
 
+    raw_optimizers = raw_optimizers_value(args.config)
+    configured_optimizers = parse_optimizers(raw_optimizers, path=args.config)
+    if args.exclude_opt is not None:
+        if args.exclude_opt not in configured_optimizers:
+            raise SystemExit(
+                f"--exclude-opt {args.exclude_opt!r} is not among config optimizers "
+                f"{configured_optimizers}"
+            )
+        configured_optimizers = [
+            opt for opt in configured_optimizers if opt != args.exclude_opt
+        ]
+        if not configured_optimizers:
+            raise SystemExit(
+                "--exclude-opt would leave no optimizers to tune."
+            )
+
+    if args.lr_only and args.ab_only:
+        raise SystemExit("--lr-only and --ab-only are mutually exclusive")
+    if args.ab_only and variant != "b":
+        raise SystemExit("--ab-only requires --variant b")
+    if variant == "c" and (args.lr_only or args.ab_only):
+        raise SystemExit("variant c does not support --lr-only or --ab-only")
+
+    if args.lr_only:
+        bound_overrides = [
+            name
+            for name, value in (
+                ("--lambda-mse-bounds", args.lambda_mse_bounds),
+                ("--lambda-fr-bounds", args.lambda_fr_bounds),
+                ("--gradient-clip-bounds", args.gradient_clip_bounds),
+                ("--lambda-ab-bounds", args.lambda_ab_bounds),
+                ("--alpha-bounds", args.alpha_bounds),
+            )
+            if value is not None
+        ]
+        if bound_overrides:
+            print(
+                "Note: ignoring hyperparameter bound overrides in --lr-only mode: "
+                + ", ".join(bound_overrides)
+            )
+    elif args.ab_only:
+        bound_overrides = [
+            name
+            for name, value in (
+                ("--lambda-mse-bounds", args.lambda_mse_bounds),
+                ("--lambda-fr-bounds", args.lambda_fr_bounds),
+                ("--gradient-clip-bounds", args.gradient_clip_bounds),
+                ("--alpha-bounds", args.alpha_bounds),
+            )
+            if value is not None
+        ]
+        if bound_overrides:
+            print(
+                "Note: ignoring hyperparameter bound overrides in --ab-only mode: "
+                + ", ".join(bound_overrides)
+            )
+
     base_config = load_experiment_config(args.config)
     if base_config.config.training.mask_method != "cell":
         raise SystemExit(
@@ -667,253 +1248,54 @@ def main(argv: list[str] | None = None) -> None:
             f"got {base_config.config.training.mask_method!r}"
         )
     _verify_room_data(base_config)
-    use_lambda_fr_constraint = not args.no_constraint
+    lr_only = args.lr_only
+    ab_only = args.ab_only
+    use_lambda_fr_constraint = (
+        not args.no_constraint and not lr_only and not ab_only and variant != "c"
+    )
     optimize_error = args.error
 
     if args.resume is not None:
-        if not args.resume.is_file():
-            raise SystemExit(f"Resume file not found: {args.resume}")
-        source_dir = args.resume.parent
-        output_dir = args.output_dir or source_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
-        run_meta = _load_run_meta(source_dir)
-        saved_variant = run_meta.get("variant")
-        if saved_variant != variant:
-            raise SystemExit(
-                f"Resume variant mismatch: run_meta.json has variant={saved_variant!r}, "
-                f"but --variant={variant!r}"
-            )
-        bounds = {name: tuple(values) for name, values in run_meta["bounds"].items()}
-        param_names = list(bounds.keys())
-        saved_lambda_fr_constraint = run_meta.get("lambda_fr_constraint", False)
-        saved_optimize_error = run_meta.get("optimize_error", False)
-        current_parameter_constraints = lambda_fr_mse_parameter_constraints(
-            enabled=use_lambda_fr_constraint,
-            bounds=bounds,
-        )
-        saved_parameter_constraints = run_meta.get("parameter_constraints")
-        if saved_parameter_constraints is None:
-            legacy_bounds = {
-                name: bound for name, bound in bounds.items() if name != "lambda_ab"
-            }
-            saved_parameter_constraints = lambda_fr_mse_parameter_constraints(
-                enabled=saved_lambda_fr_constraint,
-                bounds=legacy_bounds,
-            )
-        source_client = _load_ax_client(args.resume)
+        resume_meta = _load_run_meta(args.resume.parent)
+        optimizers_to_run: list[str | None] = [resume_meta.get("optimizer")]
+    elif len(configured_optimizers) > 1:
+        optimizers_to_run = configured_optimizers
+    else:
+        optimizers_to_run = [None]
 
-        if (
-            _objectives_match(source_client, optimize_error=optimize_error)
-            and saved_lambda_fr_constraint == use_lambda_fr_constraint
-            and saved_optimize_error == optimize_error
-            and saved_parameter_constraints == current_parameter_constraints
-        ):
-            ax_client = source_client
-            completed = len(ax_client.get_trials_data_frame())
-            print(f"Resuming from {args.resume} ({completed} completed trials)")
+    multi_optimizer = len(optimizers_to_run) > 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    for optimizer in optimizers_to_run:
+        if multi_optimizer and optimizer is not None:
+            print(f"\n=== Optimizer: {optimizer} ===")
+        if args.resume is not None:
+            output_dir = args.output_dir or args.resume.parent
+            resume_path = args.resume
         else:
-            source_df = source_client.get_trials_data_frame()
-            n_source = len(
-                source_df[source_df["trial_status"] == "COMPLETED"]
-                if "trial_status" in source_df.columns
-                else source_df
-            )
-            if not _objectives_match(source_client, optimize_error=optimize_error):
-                old_objectives = sorted(_ax_objective_names(source_client))
-                new_objectives = sorted(
-                    _current_objective_names(optimize_error=optimize_error)
-                )
-                print(
-                    f"Objective mismatch ({old_objectives} -> {new_objectives}); "
-                    f"migrating {n_source} completed trials from {args.resume}"
-                )
-            elif saved_lambda_fr_constraint != use_lambda_fr_constraint:
-                print(
-                    "Parameter-constraint mismatch "
-                    f"(saved={saved_lambda_fr_constraint}, "
-                    f"current={use_lambda_fr_constraint}); "
-                    f"migrating {n_source} completed trials from {args.resume}"
-                )
-            elif saved_optimize_error != optimize_error:
-                print(
-                    "Objective-mode mismatch "
-                    f"(saved optimize_error={saved_optimize_error}, "
-                    f"current={optimize_error}); "
-                    f"migrating {n_source} completed trials from {args.resume}"
-                )
-            elif saved_parameter_constraints != current_parameter_constraints:
-                print(
-                    "Parameter-constraint mismatch "
-                    f"(saved={saved_parameter_constraints}, "
-                    f"current={current_parameter_constraints}); "
-                    f"migrating {n_source} completed trials from {args.resume}"
-                )
-            if output_dir.resolve() != source_dir.resolve():
-                _copy_run_artifacts(source_dir, output_dir)
-            ax_client = _create_ax_client(
+            output_dir = _resolve_output_dir(
+                base_output_dir=args.output_dir,
                 experiment_type=base_config.experiment_type,
                 variant=variant,
-                bounds=bounds,
-                random_seed=args.random_seed,
-                sobol_trials=args.sobol_trials,
-                use_lambda_fr_constraint=use_lambda_fr_constraint,
-                optimize_error=optimize_error,
+                optimizer=optimizer,
+                stamp=stamp,
+                multi_optimizer=multi_optimizer,
             )
-            completed = _attach_completed_trials(
-                ax_client,
-                source_df,
-                param_names,
-                optimize_error=optimize_error,
-            )
-            _write_run_meta(
-                output_dir,
-                variant=variant,
-                config_path=args.config,
-                bounds=bounds,
-                use_lambda_fr_constraint=use_lambda_fr_constraint,
-                optimize_error=optimize_error,
-                migrated_from=args.resume,
-            )
-            ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
-            print(
-                f"Attached {completed} trials; continuing in {output_dir} "
-                f"from trial {completed + 1}"
-            )
-
-        n_trials = args.n_trials
-        start_trial = completed + 1
-    else:
-        output_dir = args.output_dir or _default_output_dir(base_config.experiment_type, variant)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        bounds = search_bounds_from_config(
-            base_config,
-            variant=variant,
-            lambda_mse_bounds=args.lambda_mse_bounds,
-            lambda_fr_bounds=args.lambda_fr_bounds,
-            gradient_clip_bounds=args.gradient_clip_bounds,
-            lambda_ab_bounds=args.lambda_ab_bounds,
-            alpha_bounds=args.alpha_bounds,
-        )
-        _write_run_meta(
-            output_dir,
-            variant=variant,
+            resume_path = None
+        _run_bo_session(
+            base_config=base_config,
             config_path=args.config,
-            bounds=bounds,
-            use_lambda_fr_constraint=use_lambda_fr_constraint,
-            optimize_error=optimize_error,
-        )
-        ax_client = _create_ax_client(
-            experiment_type=base_config.experiment_type,
             variant=variant,
-            bounds=bounds,
-            random_seed=args.random_seed,
-            sobol_trials=args.sobol_trials,
-            use_lambda_fr_constraint=use_lambda_fr_constraint,
-            optimize_error=optimize_error,
-        )
-        ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
-        n_trials = args.n_trials
-        start_trial = 1
-
-        probe_params = _probe_params(base_config, variant=variant)
-        probe_config = apply_trial_params(base_config, probe_params, variant=variant)
-        probe_experiment = create_experiment(probe_config)
-        probe_rooms = probe_experiment.load_rooms()
-        n_segments = estimate_trial_segments(probe_experiment, probe_rooms)
-        if base_config.experiment_type == "single_room":
-            n_epochs = probe_config.config.n_epochs
-            training_unit = f"{n_epochs} epoch{'s' if n_epochs != 1 else ''}"
-        elif base_config.experiment_type == "two_rooms":
-            training_unit = "1 repetition"
-        else:
-            training_unit = "1 cycle"
-        print(
-            f"[{base_config.experiment_type}] variant {variant}: each trial warmup + {training_unit} "
-            f"(~{n_segments} TBPTT segments). Output: {output_dir}"
-        )
-        print("Search bounds:", json.dumps(bounds, indent=2, default=list))
-        objectives, outcome_constraints, tracking_metrics = _ax_setup(
-            optimize_error=optimize_error
-        )
-        parameter_constraints = lambda_fr_mse_parameter_constraints(
-            enabled=use_lambda_fr_constraint,
-            bounds=bounds,
-        )
-        print("Objectives:", ", ".join(objectives))
-        print("Tracking metrics:", tracking_metrics or "none")
-        print("Outcome constraints:", outcome_constraints or "none")
-        print(
-            "Parameter constraints:",
-            parameter_constraints or "none",
-        )
-
-    if start_trial > n_trials:
-        print(f"All {n_trials} trials already completed.")
-        return
-
-    def _run_one_trial(
-        trial_index: int, params: dict[str, Any]
-    ) -> tuple[int, dict[str, Any], dict[str, float]]:
-        trial_config = apply_trial_params(base_config, params, variant=variant)
-        metrics = run_hyperparam_trial(
-            trial_config,
-            params,
-            variant=variant,
-            trial_index=trial_index,
+            optimizer=optimizer,
             output_dir=output_dir,
-            show_progress=args.show_progress,
+            n_trials=args.n_trials,
+            resume_path=resume_path,
+            args=args,
+            lr_only=lr_only,
+            ab_only=ab_only,
+            use_lambda_fr_constraint=use_lambda_fr_constraint,
+            optimize_error=optimize_error,
         )
-        return trial_index, params, metrics
-
-    trial_num = start_trial
-    while trial_num <= n_trials:
-        batch_size = min(args.parallel_trials, n_trials - trial_num + 1)
-        trials, _ = ax_client.get_next_trials(max_trials=batch_size)
-
-        if batch_size == 1:
-            trial_index, params = next(iter(trials.items()))
-            completed = [_run_one_trial(trial_index, params)]
-        else:
-            completed = []
-            with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                futures = {
-                    executor.submit(_run_one_trial, trial_index, params): trial_index
-                    for trial_index, params in trials.items()
-                }
-                for future in as_completed(futures):
-                    completed.append(future.result())
-            completed.sort(key=lambda row: row[0])
-
-        for trial_index, params, metrics in completed:
-            ax_client.complete_trial(
-                trial_index=trial_index,
-                raw_data=_ax_raw_data(metrics, optimize_error=optimize_error),
-            )
-
-            timestamp = datetime.now(timezone.utc).isoformat()
-            row = {
-                "trial_index": trial_index,
-                "timestamp": timestamp,
-                **params,
-                **metrics,
-            }
-            _append_trial_csv(output_dir, row, variant=variant)
-            _print_trial_summary(
-                trial_num,
-                n_trials,
-                trial_index,
-                params,
-                metrics,
-                ax_client,
-                variant=variant,
-                optimize_error=optimize_error,
-            )
-            trial_num += 1
-
-        ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
-        _write_summary(output_dir, ax_client, optimize_error=optimize_error)
-
-    print(f"\nDone. Results in {output_dir}")
 
 
 if __name__ == "__main__":

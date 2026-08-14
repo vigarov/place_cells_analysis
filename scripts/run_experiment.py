@@ -44,10 +44,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Config file not found: {args.config}")
 
     run_config = load_experiment_config(args.config)
-    base_lr = run_config.config.training.learning_rate
 
     for opt_type in run_config.optimizers:
-        optimizer_config = build_optimizer_config(opt_type, base_lr)
+        optimizer_config = build_optimizer_config(opt_type)
         experiment = create_experiment(run_config, optimizer_config=optimizer_config)
         paths = experiment.resolve_paths()
         if run_is_complete(paths):

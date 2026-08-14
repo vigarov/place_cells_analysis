@@ -67,13 +67,16 @@ def run_warmup(
     mask_generator=None,
     show_progress_level: int = 0,
     experiment_name: str = "",
-) -> None:
+    abort_on_nan: bool = False,
+) -> bool:
     """Pretrain on warmup trajectories for all rooms, one trajectory at a time.
 
     No gradient/optimizer-signal capture and no activation capture during warmup
 
     When `warmup_shuffle` is true, trajectories from all rooms are pooled and
     shuffled with `warmup_shuffle_seed` before training.
+
+    Returns False when `abort_on_nan` is set and non-finite loss/weights appear.
     """
     warmup_config = replace(config, step_size=step_size)
     warmup_wsm_cache: dict[int, WeakSMCell] = {}
@@ -83,9 +86,9 @@ def run_warmup(
             warmup_wsm_cache[room_idx] = build_warmup_wsm(wsm, sigma=gaussian_sigma)
         return warmup_wsm_cache[room_idx]
 
-    def train_step(room_idx: int, traj_idx: int) -> None:
+    def train_step(room_idx: int, traj_idx: int) -> bool:
         room = rooms[room_idx]
-        train_trajectory_segments(
+        return train_trajectory_segments(
             rae,
             optimizer,
             room.traj_coord[traj_idx : traj_idx + 1],
@@ -93,6 +96,7 @@ def run_warmup(
             device,
             warmup_config,
             mask_generator=mask_generator,
+            abort_on_nan=abort_on_nan,
         )
 
     desc = f"{experiment_name} warmup" if experiment_name else "Warmup"
@@ -110,7 +114,8 @@ def run_warmup(
         if show_progress_level >= 1:
             step_iter = tqdm(trajectories_to_run, desc=desc, unit="traj", leave=warmup_shuffle)
         for room_idx, traj_idx in step_iter:
-            train_step(room_idx, traj_idx)
+            if not train_step(room_idx, traj_idx):
+                return False
     else:
         room_iter = enumerate(rooms)
         if show_progress_level >= 1:
@@ -120,4 +125,6 @@ def run_warmup(
             if show_progress_level >= 1:
                 traj_iter = tqdm(traj_iter, desc="Warmup", unit="traj", leave=False)
             for traj_idx in traj_iter:
-                train_step(room_idx, traj_idx)
+                if not train_step(room_idx, traj_idx):
+                    return False
+    return True

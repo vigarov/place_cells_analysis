@@ -16,7 +16,7 @@ from experiments.old_cycles.cycles_paths import (
 )
 from experiments.old_cycles.constants import STEP_SIZE
 from core.utils import compute_ratemap
-from models.utils import RaeModelConfig, build_rae, rae_model_config_from_dict
+from models.utils import RaeModelConfig, build_rae, rae_model_config_from_dict, seed_model_init
 from core.old_training import (
     TrainMode,
     rebatch_trajectories,
@@ -61,6 +61,7 @@ class CyclesConfig(CyclesPathConfig):
     n_rooms: int = 20
     schedule_seed: int = 0
     mask_rng_seed: int = 0
+    init_seed: int = 3003
 
     record_n_segments: int | None = None  # None -> derive from trajectory or use all
 
@@ -665,6 +666,7 @@ def run_cycles_experiment(
         dt=manifest.dt_s,
     )
     traj0_rebatched = rebatch_trajectories(traj0, n_segments=n_seg)
+    seed_model_init(config.init_seed)
     rae = build_rae(
         config.n_wsm_cells,
         config.n_hidden,

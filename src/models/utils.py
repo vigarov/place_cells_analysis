@@ -2,6 +2,7 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
+from models.bump_activation import BumpActivation
 from models.custom_learnable_activation import CustomLearnableActivation
 from models.nn4n.nn import (
     RNN,
@@ -31,6 +32,9 @@ class RaeModelConfig:
     learn_alpha: bool = False
     preact_noise: float = 0.0
     postact_noise: float = 0.0
+    bump_nl: float | None = None
+    bump_nr: float | None = None
+    bump_s: float = 3.0
 
 
 _RAE_MODEL_CONFIG_FIELDS = {f.name for f in fields(RaeModelConfig)}
@@ -42,18 +46,44 @@ def rae_model_config_from_dict(raw: dict[str, Any]) -> RaeModelConfig:
     return RaeModelConfig(**kwargs)
 
 
-def resolve_activation(name: str, hidden_size: int) -> torch.nn.Module:
+def resolve_activation(
+    name: str,
+    hidden_size: int,
+    *,
+    model: RaeModelConfig | None = None,
+) -> torch.nn.Module:
     key = name.lower()
+    if key == "bump_activation":
+        if model is None or model.bump_nl is None or model.bump_nr is None:
+            raise ValueError(
+                "bump_activation requires bump_nl and bump_nr in RaeModelConfig"
+            )
+        return BumpActivation(
+            hidden_size,
+            nl=model.bump_nl,
+            nr=model.bump_nr,
+            s=model.bump_s,
+        )
     sized_factory = _SIZE_DEPENDENT_ACTIVATIONS.get(key)
     if sized_factory is not None:
         return sized_factory(hidden_size)
     factory = _ACTIVATION_FACTORIES.get(key)
     if factory is None:
         supported = ", ".join(
-            sorted(_ACTIVATION_FACTORIES | _SIZE_DEPENDENT_ACTIVATIONS)
+            sorted(
+                _ACTIVATION_FACTORIES
+                | _SIZE_DEPENDENT_ACTIVATIONS
+                | {"bump_activation"}
+            )
         )
         raise ValueError(f"Unknown activation {name!r}; supported: {supported}")
     return factory()
+
+
+
+def seed_model_init(init_seed: int) -> None:
+    """Seed PyTorch's global RNG before ``build_rae`` for reproducible init."""
+    torch.manual_seed(init_seed)
 
 
 def build_rae(
@@ -69,7 +99,7 @@ def build_rae(
     output_layer = LinearLayer(input_dim=n_hidden, output_dim=n_cells)
     leaky_layer = LeakyLinearLayer(
         linear_layer=LinearLayer(input_dim=n_hidden, output_dim=n_hidden),
-        activation=resolve_activation(model.activation, n_hidden),
+        activation=resolve_activation(model.activation, n_hidden, model=model),
         alpha=model.alpha,
         learn_alpha=model.learn_alpha,
         preact_noise=model.preact_noise,

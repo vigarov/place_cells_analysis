@@ -21,11 +21,13 @@ from experiments.common.run import ExperimentRunConfig, create_experiment
 from experiments.many_rooms.experiment import MANY_ROOMS_NAME
 from experiments.single_room.experiment import SINGLE_ROOM_NAME
 from experiments.two_rooms.experiment import TWO_ROOMS_NAME
+from models.bump_activation import BumpActivation
 from models.custom_learnable_activation import CustomLearnableActivation
-from models.utils import build_rae
+from models.utils import build_rae, seed_model_init
 from optimizers import optimizer_extractor_from_dict
+from optimizers.defaults import build_optimizer_config
 
-BoVariant = Literal["a", "b"]
+BoVariant = Literal["a", "b", "c"]
 SearchBounds = dict[str, tuple[float, float]]
 
 ACTIVITY_TARGET = 0.40
@@ -70,9 +72,20 @@ VARIANT_B_BOUNDS: dict[str, tuple[float, float]] = {
     "alpha": (0.0001, 0.2),
 }
 
+VARIANT_C_BOUNDS: dict[str, tuple[float, float]] = {
+    "nl": (1.0, 3.0),
+    "nr": (2.0, 6.0),
+    "s": (1.0, 4.0),
+}
+
+LR_ONLY_BOUNDS: tuple[float, float] = (1e-5, 0.1)
+
 
 MAX_FR_FACTOR = 100.0
 MAX_AB_FACTOR = MAX_FR_FACTOR / 10.0
+BUMP_STEEPNESS_MARGIN = 1e-6
+
+
 def lambda_fr_mse_parameter_constraints(
     *,
     enabled: bool = True,
@@ -93,22 +106,90 @@ def lambda_fr_mse_parameter_constraints(
     return constraints
 
 
+def bump_activation_parameter_constraints(
+    *,
+    bounds: SearchBounds | None = None,
+    margin: float = BUMP_STEEPNESS_MARGIN,
+) -> list[str]:
+    """Ax parameter constraints enforcing nr > nl for BumpActivation shape search."""
+    if bounds is None or not {"nl", "nr"}.issubset(bounds):
+        return []
+    return [f"nl - nr <= {-margin:g}"]
+
+
+def bo_parameter_constraints(
+    *,
+    variant: BoVariant,
+    enabled: bool = True,
+    bounds: SearchBounds | None = None,
+) -> list[str]:
+    if variant == "c":
+        return bump_activation_parameter_constraints(bounds=bounds)
+    return lambda_fr_mse_parameter_constraints(enabled=enabled, bounds=bounds)
+
+
 def search_bounds_from_config(
     run_config: ExperimentRunConfig,
     *,
     variant: BoVariant = "a",
+    lr_only: bool = False,
+    ab_only: bool = False,
     lambda_mse_bounds: tuple[float, float] | None = None,
     lambda_fr_bounds: tuple[float, float] | None = None,
     gradient_clip_bounds: tuple[float, float] | None = None,
     mask_rate_bounds: tuple[float, float] | None = None,
     lambda_ab_bounds: tuple[float, float] | None = None,
     alpha_bounds: tuple[float, float] | None = None,
+    nl_bounds: tuple[float, float] | None = None,
+    nr_bounds: tuple[float, float] | None = None,
+    s_bounds: tuple[float, float] | None = None,
+    apply_ab_constraint: bool = True,
 ) -> SearchBounds:
     """Compute Ax search bounds for the given BO variant """
     if run_config.config.training.mask_method != "cell":
         raise ValueError(
             f"We only perform BO for 'cell' mask type; got {run_config.config.training.mask_method!r}"
         )
+
+    if lr_only and ab_only:
+        raise ValueError("lr_only and ab_only are mutually exclusive")
+    if variant == "c" and (lr_only or ab_only):
+        raise ValueError("variant c does not support lr_only or ab_only")
+
+    if lr_only:
+        return {"learning_rate": LR_ONLY_BOUNDS}
+
+    if ab_only:
+        if variant != "b":
+            raise ValueError("ab_only requires variant b")
+        low, high = VARIANT_B_BOUNDS["lambda_ab"]
+        if lambda_ab_bounds is not None:
+            low, high = lambda_ab_bounds
+        if apply_ab_constraint:
+            max_ab = MAX_AB_FACTOR * run_config.config.training.lambda_mse
+            high = min(high, max_ab)
+        if low >= high:
+            raise ValueError(
+                f"lambda_ab search bounds are empty after constraint clipping: ({low}, {high})"
+            )
+        return {"lambda_ab": (low, high)}
+
+    if variant == "c":
+        bounds: SearchBounds = dict(VARIANT_C_BOUNDS)
+        if nl_bounds is not None:
+            bounds["nl"] = nl_bounds
+        if nr_bounds is not None:
+            bounds["nr"] = nr_bounds
+        if s_bounds is not None:
+            bounds["s"] = s_bounds
+        nl_lo, nl_hi = bounds["nl"]
+        nr_lo, nr_hi = bounds["nr"]
+        if nl_lo >= nr_hi:
+            raise ValueError(
+                "BumpActivation search bounds must allow nr > nl; "
+                f"got nl in ({nl_lo}, {nl_hi}) and nr in ({nr_lo}, {nr_hi})"
+            )
+        return bounds
 
     base_bounds = VARIANT_A_BOUNDS if variant == "a" else dict(VARIANT_B_BOUNDS)
     bounds: SearchBounds = dict(base_bounds)
@@ -127,35 +208,34 @@ def search_bounds_from_config(
     return bounds
 
 
-def apply_trial_params(
+def fixed_trial_params(
     base_config: ExperimentRunConfig,
-    params: dict[str, Any],
     *,
-    variant: BoVariant = "a",
-) -> ExperimentRunConfig:
-    """Override trial hyperparameters"""
-    if base_config.config.training.mask_method != "cell":
-        raise ValueError(
-            f"We only perform BO for 'cell' mask type; got {base_config.config.training.mask_method!r}"
-        )
-
-    run_config = copy.deepcopy(base_config)
-    config = run_config.config
-
-    config.training = replace(
-        config.training,
-        lambda_mse=float(params["lambda_mse"]),
-        lambda_fr=float(params["lambda_fr"]),
-        gradient_clip_max=float(params["gradient_clip_max"]),
-        mask_rate=float(params["mask_rate"]),
-    )
-    config.warmup = replace(config.warmup, warmup_shuffle=True)
-
-    model_kwargs: dict[str, Any] = {"alpha": float(params["alpha"])}
+    variant: BoVariant,
+) -> dict[str, Any]:
+    """Hyperparameters fixed from config (used for lr-only probe/printing)."""
+    training = base_config.config.training
+    params: dict[str, Any] = {
+        "lambda_mse": training.lambda_mse,
+        "lambda_fr": training.lambda_fr,
+        "gradient_clip_max": training.gradient_clip_max or 10.0,
+        "mask_rate": training.mask_rate,
+        "alpha": base_config.config.model.alpha,
+    }
     if variant == "b":
-        model_kwargs["activation"] = "custom_learnable"
-    config.model = replace(config.model, **model_kwargs)
+        params["lambda_ab"] = training.lambda_fr / 100.0
+    elif variant == "c":
+        model = base_config.config.model
+        params["nl"] = model.bump_nl if model.bump_nl is not None else 1.5
+        params["nr"] = model.bump_nr if model.bump_nr is not None else 3.0
+        params["s"] = model.bump_s
+    return params
 
+
+def _apply_bo_protocol_overrides(
+    run_config: ExperimentRunConfig,
+) -> None:
+    config = run_config.config
     if run_config.experiment_type == SINGLE_ROOM_NAME:
         config.n_epochs = 2
     elif run_config.experiment_type == TWO_ROOMS_NAME:
@@ -165,13 +245,97 @@ def apply_trial_params(
     else:
         raise ValueError(f"Unknown experiment_type: {run_config.experiment_type!r}")
 
+
+def apply_trial_params(
+    base_config: ExperimentRunConfig,
+    params: dict[str, Any],
+    *,
+    variant: BoVariant = "a",
+    lr_only: bool = False,
+    ab_only: bool = False,
+) -> ExperimentRunConfig:
+    """Override trial hyperparameters"""
+    if base_config.config.training.mask_method != "cell":
+        raise ValueError(
+            f"We only perform BO for 'cell' mask type; got {base_config.config.training.mask_method!r}"
+        )
+
+    if lr_only and ab_only:
+        raise ValueError("lr_only and ab_only are mutually exclusive")
+
+    run_config = copy.deepcopy(base_config)
+    config = run_config.config
+    training = config.training
+
+    if lr_only or ab_only:
+        if variant == "b":
+            config.model = replace(config.model, activation="custom_learnable")
+    elif variant == "c":
+        config.model = replace(
+            config.model,
+            activation="bump_activation",
+            bump_nl=float(params["nl"]),
+            bump_nr=float(params["nr"]),
+            bump_s=float(params["s"]),
+        )
+    else:
+        config.training = replace(
+            training,
+            lambda_mse=float(params["lambda_mse"]),
+            lambda_fr=float(params["lambda_fr"]),
+            gradient_clip_max=float(params["gradient_clip_max"]),
+            mask_rate=float(params["mask_rate"]),
+        )
+
+        model_kwargs: dict[str, Any] = {"alpha": float(params["alpha"])}
+        if variant == "b":
+            model_kwargs["activation"] = "custom_learnable"
+        config.model = replace(config.model, **model_kwargs)
+
+    config.warmup = replace(config.warmup, warmup_shuffle=True)
+    _apply_bo_protocol_overrides(run_config)
     return run_config
 
 
 def trial_lambda_ab(params: dict[str, Any], *, variant: BoVariant) -> float:
     if variant == "b":
-        return float(params["lambda_ab"])
+        if "lambda_ab" in params:
+            return float(params["lambda_ab"])
+        return 0.0
     return 0.0
+
+
+def aborted_trial_metrics(*, variant: BoVariant) -> dict[str, float]:
+    """Sentinel metrics for trials aborted due to non-finite training."""
+    metrics = replace_bad_run_metrics(
+        {
+            "loss": BAD_RUN_LOSS,
+            "train_error": BAD_RUN_TRAIN_ERROR,
+            "eval_error": BAD_RUN_TRAIN_ERROR,
+            "activity_score": BAD_RUN_ACTIVITY_SCORE,
+            "activity_fraction": 0.0,
+            "aborted_nan": 1.0,
+        }
+    )
+    if variant == "b":
+        metrics.update(
+            {
+                "activation_a_mean": float("nan"),
+                "activation_a_sem": float("nan"),
+                "activation_b_mean": float("nan"),
+                "activation_b_sem": float("nan"),
+            }
+        )
+    elif variant == "c":
+        metrics.update(
+            {
+                "activation_A_mean": float("nan"),
+                "activation_A_sem": float("nan"),
+                "activation_m_mean": float("nan"),
+                "activation_m_sem": float("nan"),
+            }
+        )
+    return metrics
 
 
 def _train_config(
@@ -188,7 +352,6 @@ def _train_config(
         step_size=step_size,
         lambda_mse=training.lambda_mse,
         lambda_fr=training.lambda_fr,
-        learning_rate=training.learning_rate,
         gradient_clip_max=training.gradient_clip_max,
         carry_state=training.carry_state,
         lambda_ab=lambda_ab,
@@ -263,6 +426,23 @@ def mean_prediction_mse(
             if carry_state:
                 init_states = states[0][:, -1, :].clone()
     return float(np.mean(losses)) if losses else float("nan")
+
+
+def bump_activation_parameter_stats(rae: torch.nn.Module) -> dict[str, float]:
+    """Mean + SEM for learned A and m in BumpActivation."""
+    for module in rae.modules():
+        if isinstance(module, BumpActivation):
+            a = module.A.detach().cpu().numpy().ravel()
+            m = module.m.detach().cpu().numpy().ravel()
+            sem_a = float(np.std(a, ddof=1) / np.sqrt(a.size)) if a.size > 1 else 0.0
+            sem_m = float(np.std(m, ddof=1) / np.sqrt(m.size)) if m.size > 1 else 0.0
+            return {
+                "activation_A_mean": float(np.mean(a)),
+                "activation_A_sem": sem_a,
+                "activation_m_mean": float(np.mean(m)),
+                "activation_m_sem": sem_m,
+            }
+    return {}
 
 
 def custom_activation_parameter_stats(rae: torch.nn.Module) -> dict[str, float]:
@@ -448,6 +628,8 @@ def compute_trial_metrics(
     )
     if variant == "b":
         metrics.update(custom_activation_parameter_stats(rae))
+    elif variant == "c":
+        metrics.update(bump_activation_parameter_stats(rae))
     if return_ratemaps:
         return metrics, ratemaps
     return metrics
@@ -508,6 +690,7 @@ def _build_trial_model(
     device: torch.device,
 ) -> torch.nn.Module:
     config = experiment.config
+    seed_model_init(config.training.init_seed)
     return build_rae(
         config.room.n_wsm_cells,
         config.training.n_hidden,
@@ -527,11 +710,22 @@ def run_hyperparam_trial(
     lambda_unif: float = 0.0,
 ) -> dict[str, float]:
     """Run warmup plus the configured training protocol and return Ax trial metrics."""
-    experiment = create_experiment(run_config)
+    opt_type = run_config.optimizers[0]
+    optimizer_config = None
+    if "learning_rate" in params:
+        optimizer_config = build_optimizer_config(
+            opt_type, lr=float(params["learning_rate"])
+        )
+    experiment = create_experiment(run_config, optimizer_config=optimizer_config)
     config = experiment.config
     device = config.resolve_device()
     rooms = experiment.load_rooms()
-    lambda_ab = trial_lambda_ab(params, variant=variant)
+    if variant == "b" and "lambda_ab" in params:
+        lambda_ab = float(params["lambda_ab"])
+    elif variant == "b":
+        lambda_ab = config.training.lambda_fr / 100.0
+    else:
+        lambda_ab = 0.0
 
     rae = _build_trial_model(experiment, device)
     extractor = optimizer_extractor_from_dict(dict(experiment.optimizer_config))
@@ -546,7 +740,7 @@ def run_hyperparam_trial(
     )
     progress_level = 1 if show_progress else 0
 
-    run_warmup(
+    if not run_warmup(
         rae,
         optimizer,
         rooms,
@@ -559,7 +753,10 @@ def run_hyperparam_trial(
         mask_generator=mask_generator,
         show_progress_level=progress_level,
         experiment_name=experiment.name,
-    )
+        abort_on_nan=True,
+    ):
+        print("Trial aborted: non-finite loss/weights during warmup")
+        return aborted_trial_metrics(variant=variant)
 
     train_step_size = round(config.training.train_step_size_s / experiment.dt)
     train_params = _train_config(
@@ -574,7 +771,7 @@ def run_hyperparam_trial(
             room = rooms[visit.room_index]
             for traj_idx in visit.traj_indices:
                 tc_full = room.main_traj[traj_idx : traj_idx + 1]
-                train_trajectory_segments(
+                if not train_trajectory_segments(
                     rae,
                     optimizer,
                     tc_full,
@@ -582,7 +779,10 @@ def run_hyperparam_trial(
                     device,
                     train_params,
                     mask_generator=mask_generator,
-                )
+                    abort_on_nan=True,
+                ):
+                    print("Trial aborted: non-finite loss/weights during training")
+                    return aborted_trial_metrics(variant=variant)
 
     need_ratemaps = output_dir is not None and trial_index is not None
     if need_ratemaps:
@@ -595,6 +795,7 @@ def run_hyperparam_trial(
             variant=variant,
             lambda_unif=lambda_unif,
         )
+        metrics["aborted_nan"] = 0.0
         ratemap_path = save_trial_ratemap(
             output_dir, trial_index, ratemaps[0], params, metrics=metrics
         )
@@ -609,4 +810,5 @@ def run_hyperparam_trial(
         variant=variant,
         lambda_unif=lambda_unif,
     )
+    metrics["aborted_nan"] = 0.0
     return metrics
