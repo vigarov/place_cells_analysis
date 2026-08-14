@@ -57,5 +57,5 @@
     },
     "n_repetitions": 4
   },
-  "optimizers": "adagrad"
+  "optimizers": "all"
 }
