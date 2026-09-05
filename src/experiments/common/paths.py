@@ -44,6 +44,13 @@ _RATEMAPS_SUBDIR = "ratemaps"
 GAUSSIAN_RF_FITS_FILENAME = "gaussian_rf_fits.npz"
 _TWO_ROOMS = "two_rooms"
 _EXPERIMENT_TYPE_NAMES = frozenset({"single_room", "two_rooms", "many_rooms"})
+_ALT_TOO_SUFFIX = "_altTOO"
+
+
+def _is_experiment_family_dir(name: str) -> bool:
+    if name in _EXPERIMENT_TYPE_NAMES:
+        return True
+    return any(name == f"{exp}{_ALT_TOO_SUFFIX}" for exp in _EXPERIMENT_TYPE_NAMES)
 
 
 def is_experiment_results_dir(path: Path) -> bool:
@@ -58,7 +65,7 @@ def is_optimizer_results_dir(path: Path) -> bool:
     suffix_dir = path.parent
     if suffix_dir.name in _EXPERIMENT_TYPE_NAMES:
         return False
-    return suffix_dir.parent.name in _EXPERIMENT_TYPE_NAMES
+    return _is_experiment_family_dir(suffix_dir.parent.name)
 
 
 def gaussian_rf_fits_filename(experiment_name: str, room_idx: int) -> str:
