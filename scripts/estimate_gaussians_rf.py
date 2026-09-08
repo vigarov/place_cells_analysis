@@ -33,6 +33,7 @@ from pathlib import Path
 import numpy as np
 
 from experiments.common.paths import (
+    experiment_type_from_family_dir,
     gaussian_rf_fits_path,
     discover_optimizer_results_dirs,
     filter_optimizer_results_dirs,
@@ -83,8 +84,9 @@ def _fit_room_indices(experiment_name: str, room_idx: int | None) -> list[int]:
 def _infer_experiment_from_path(path: Path) -> str | None:
     """Return the nearest ancestor directory named like a room experiment."""
     for parent in (path.resolve(), *path.resolve().parents):
-        if parent.name in EXPERIMENT_TYPES:
-            return parent.name
+        experiment_type = experiment_type_from_family_dir(parent.name)
+        if experiment_type is not None:
+            return experiment_type
     return None
 
 

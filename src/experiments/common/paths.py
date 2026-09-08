@@ -1,6 +1,7 @@
 """Shared results/signals/ratemaps/checkpoint path layout for room experiments."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,13 +45,27 @@ _RATEMAPS_SUBDIR = "ratemaps"
 GAUSSIAN_RF_FITS_FILENAME = "gaussian_rf_fits.npz"
 _TWO_ROOMS = "two_rooms"
 _EXPERIMENT_TYPE_NAMES = frozenset({"single_room", "two_rooms", "many_rooms"})
-_ALT_TOO_SUFFIX = "_altTOO"
+# Keep in sync with `core.alt_training.alt_training_path_tag` static suffixes.
+_ALT_TRAINING_STATIC_SUFFIXES = ("_altTOO", "_plateau")
+_ALT_LORA_FAMILY_RE = re.compile(r"^(.+)_altTLORA_r(\d+)$")
+
+
+def experiment_type_from_family_dir(name: str) -> str | None:
+    """Map a results family directory name to its base experiment type."""
+    if name in _EXPERIMENT_TYPE_NAMES:
+        return name
+    for experiment_type in _EXPERIMENT_TYPE_NAMES:
+        for suffix in _ALT_TRAINING_STATIC_SUFFIXES:
+            if name == f"{experiment_type}{suffix}":
+                return experiment_type
+    lora_match = _ALT_LORA_FAMILY_RE.fullmatch(name)
+    if lora_match is not None and lora_match.group(1) in _EXPERIMENT_TYPE_NAMES:
+        return lora_match.group(1)
+    return None
 
 
 def _is_experiment_family_dir(name: str) -> bool:
-    if name in _EXPERIMENT_TYPE_NAMES:
-        return True
-    return any(name == f"{exp}{_ALT_TOO_SUFFIX}" for exp in _EXPERIMENT_TYPE_NAMES)
+    return experiment_type_from_family_dir(name) is not None
 
 
 def is_experiment_results_dir(path: Path) -> bool:
