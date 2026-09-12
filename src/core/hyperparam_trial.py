@@ -3,6 +3,7 @@ Bayesian Hyperparameter search trial def (bounds, constraints, ...)
 Runs warmup + {2 epochs, 1 repetition, 1 cycle} training protocols (depending on the selected config experiment)
 """
 import copy
+import gc
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -12,8 +13,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from core.alt_training import (
+    AltTrainingVariant,
+    LocalMseUnitScaler,
+    alt_training_path_tag,
+    train_trajectory_segments_alt,
+    train_trajectory_segments_on_opt,
+)
 from core.experiment import Room, RoomExperiment
 from core.progress import group_protocol
+from core.split_weight_wrapper import (
+    DEFAULT_ALT_SPLIT_TARGETS,
+    AltTrainingOptimizerWrapper,
+    SplitWeightWrapper,
+    base_parameters_for_alt_training,
+)
+from optimizers.defaults import OPTIMIZER_LR_KEY
 from core.training import TrainConfig, fr_loss, train_trajectory_segments, unif_loss
 from core.utils import MaskMethod, apply_input_mask, compute_ratemap
 from core.warmup import run_warmup
@@ -79,6 +94,25 @@ VARIANT_C_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 LR_ONLY_BOUNDS: tuple[float, float] = (1e-5, 0.1)
+ALT_TRAINING_LORA_BETA_BOUNDS: tuple[float, float] = (0.0, 1.0)
+ALT_TRAINING_ON_OPT_KAPPA_BOUNDS: tuple[float, float] = (1.0, 3.0)
+# Backward-compatible alias
+ALT_TRAINING_BETA_BOUNDS = ALT_TRAINING_LORA_BETA_BOUNDS
+
+
+def normalize_alt_training_variant(
+    alt_training: bool | str | None,
+    *,
+    default: AltTrainingVariant = "lora",
+) -> AltTrainingVariant | None:
+    """Resolve legacy bool run_meta alt_training flags to a variant name."""
+    if alt_training is None or alt_training is False:
+        return None
+    if alt_training is True:
+        return default
+    if alt_training in ("lora", "on_opt"):
+        return alt_training  # type: ignore[return-value]
+    raise ValueError(f"Unknown alt_training value: {alt_training!r}")
 
 
 MAX_FR_FACTOR = 100.0
@@ -144,6 +178,9 @@ def search_bounds_from_config(
     nr_bounds: tuple[float, float] | None = None,
     s_bounds: tuple[float, float] | None = None,
     apply_ab_constraint: bool = True,
+    alt_training: AltTrainingVariant | None = None,
+    beta_bounds: tuple[float, float] | None = None,
+    kappa_bounds: tuple[float, float] | None = None,
 ) -> SearchBounds:
     """Compute Ax search bounds for the given BO variant """
     if run_config.config.training.mask_method != "cell":
@@ -153,8 +190,25 @@ def search_bounds_from_config(
 
     if lr_only and ab_only:
         raise ValueError("lr_only and ab_only are mutually exclusive")
+    if alt_training and (lr_only or ab_only):
+        raise ValueError("alt_training is mutually exclusive with lr_only and ab_only")
     if variant == "c" and (lr_only or ab_only):
         raise ValueError("variant c does not support lr_only or ab_only")
+
+    if alt_training:
+        if alt_training == "lora":
+            return {
+                "beta": beta_bounds
+                if beta_bounds is not None
+                else ALT_TRAINING_LORA_BETA_BOUNDS
+            }
+        if alt_training == "on_opt":
+            return {
+                "kappa": kappa_bounds
+                if kappa_bounds is not None
+                else ALT_TRAINING_ON_OPT_KAPPA_BOUNDS
+            }
+        raise ValueError(f"Unknown alt_training variant: {alt_training!r}")
 
     if lr_only:
         return {"learning_rate": LR_ONLY_BOUNDS}
@@ -253,6 +307,7 @@ def apply_trial_params(
     variant: BoVariant = "a",
     lr_only: bool = False,
     ab_only: bool = False,
+    alt_training: AltTrainingVariant | None = None,
 ) -> ExperimentRunConfig:
     """Override trial hyperparameters"""
     if base_config.config.training.mask_method != "cell":
@@ -262,12 +317,26 @@ def apply_trial_params(
 
     if lr_only and ab_only:
         raise ValueError("lr_only and ab_only are mutually exclusive")
+    if alt_training and (lr_only or ab_only):
+        raise ValueError("alt_training is mutually exclusive with lr_only and ab_only")
 
     run_config = copy.deepcopy(base_config)
     config = run_config.config
     training = config.training
 
-    if lr_only or ab_only:
+    if alt_training:
+        if variant == "b":
+            config.model = replace(config.model, activation="custom_learnable")
+        elif variant == "c":
+            model = config.model
+            config.model = replace(
+                config.model,
+                activation="bump_activation",
+                bump_nl=model.bump_nl if model.bump_nl is not None else 1.5,
+                bump_nr=model.bump_nr if model.bump_nr is not None else 3.0,
+                bump_s=model.bump_s,
+            )
+    elif lr_only or ab_only:
         if variant == "b":
             config.model = replace(config.model, activation="custom_learnable")
     elif variant == "c":
@@ -708,6 +777,8 @@ def run_hyperparam_trial(
     output_dir: Path | None = None,
     show_progress: bool = False,
     lambda_unif: float = 0.0,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
 ) -> dict[str, float]:
     """Run warmup plus the configured training protocol and return Ax trial metrics."""
     opt_type = run_config.optimizers[0]
@@ -728,8 +799,38 @@ def run_hyperparam_trial(
         lambda_ab = 0.0
 
     rae = _build_trial_model(experiment, device)
+    split_wrapper: SplitWeightWrapper | None = None
+    glocal_scaler: LocalMseUnitScaler | None = None
+    on_opt_kappa: float | None = None
+    if alt_training == "lora":
+        if alt_rank is None:
+            raise ValueError("alt_rank is required when alt_training='lora'")
+        beta = float(params["beta"])
+        split_wrapper = SplitWeightWrapper(
+            rae, DEFAULT_ALT_SPLIT_TARGETS, beta, rank=alt_rank
+        )
+        split_wrapper.install()
+        glocal_scaler = LocalMseUnitScaler(n_hidden=config.training.n_hidden)
+    elif alt_training == "on_opt":
+        on_opt_kappa = float(params["kappa"])
+        glocal_scaler = LocalMseUnitScaler(n_hidden=config.training.n_hidden)
+
     extractor = optimizer_extractor_from_dict(dict(experiment.optimizer_config))
-    optimizer = extractor.create_optimizer(rae.parameters())
+    opt_config = dict(experiment.optimizer_config)
+    if alt_training == "lora":
+        assert split_wrapper is not None
+        base_params = base_parameters_for_alt_training(rae, split_wrapper)
+        base_optimizer = extractor.create_optimizer(base_params)
+        lora_lr = float(opt_config.get(OPTIMIZER_LR_KEY, opt_config.get("lr", 1e-3)))
+        optimizer: torch.optim.Optimizer | AltTrainingOptimizerWrapper = (
+            AltTrainingOptimizerWrapper(
+                base_optimizer,
+                split_wrapper,
+                lora_lr=lora_lr,
+            )
+        )
+    else:
+        optimizer = extractor.create_optimizer(rae.parameters())
 
     mask_generator = torch.Generator(device="cpu")
     mask_generator.manual_seed(config.training.mask_rng_seed)
@@ -740,75 +841,115 @@ def run_hyperparam_trial(
     )
     progress_level = 1 if show_progress else 0
 
-    if not run_warmup(
-        rae,
-        optimizer,
-        rooms,
-        device,
-        warmup_params,
-        gaussian_sigma=config.warmup.warmup_gaussian_sigma,
-        step_size=warmup_step_size,
-        warmup_shuffle=config.warmup.warmup_shuffle,
-        warmup_shuffle_seed=config.warmup.warmup_shuffle_seed,
-        mask_generator=mask_generator,
-        show_progress_level=progress_level,
-        experiment_name=experiment.name,
-        abort_on_nan=True,
-    ):
-        print("Trial aborted: non-finite loss/weights during warmup")
-        return aborted_trial_metrics(variant=variant)
+    try:
+        if not run_warmup(
+            rae,
+            optimizer,
+            rooms,
+            device,
+            warmup_params,
+            gaussian_sigma=config.warmup.warmup_gaussian_sigma,
+            step_size=warmup_step_size,
+            warmup_shuffle=config.warmup.warmup_shuffle,
+            warmup_shuffle_seed=config.warmup.warmup_shuffle_seed,
+            mask_generator=mask_generator,
+            show_progress_level=progress_level,
+            experiment_name=experiment.name,
+            abort_on_nan=True,
+        ):
+            print("Trial aborted: non-finite loss/weights during warmup")
+            return aborted_trial_metrics(variant=variant)
 
-    train_step_size = round(config.training.train_step_size_s / experiment.dt)
-    train_params = _train_config(
-        experiment, train_step_size, lambda_ab=lambda_ab, lambda_unif=lambda_unif
-    )
+        train_step_size = round(config.training.train_step_size_s / experiment.dt)
+        train_params = _train_config(
+            experiment, train_step_size, lambda_ab=lambda_ab, lambda_unif=lambda_unif
+        )
 
-    protocol = experiment.build_protocol()
-    groups = group_protocol(protocol)
+        protocol = experiment.build_protocol()
+        groups = group_protocol(protocol)
 
-    for _, group_visits in groups:
-        for visit in group_visits:
-            room = rooms[visit.room_index]
-            for traj_idx in visit.traj_indices:
-                tc_full = room.main_traj[traj_idx : traj_idx + 1]
-                if not train_trajectory_segments(
-                    rae,
-                    optimizer,
-                    tc_full,
-                    room.wsm,
-                    device,
-                    train_params,
-                    mask_generator=mask_generator,
-                    abort_on_nan=True,
-                ):
-                    print("Trial aborted: non-finite loss/weights during training")
-                    return aborted_trial_metrics(variant=variant)
+        for _, group_visits in groups:
+            for visit in group_visits:
+                room = rooms[visit.room_index]
+                for traj_idx in visit.traj_indices:
+                    tc_full = room.main_traj[traj_idx : traj_idx + 1]
+                    if alt_training == "lora":
+                        assert split_wrapper is not None and glocal_scaler is not None
+                        train_ok = train_trajectory_segments_alt(
+                            rae,
+                            optimizer,
+                            tc_full,
+                            room.wsm,
+                            device,
+                            train_params,
+                            split_wrapper=split_wrapper,
+                            scaler=glocal_scaler,
+                            mask_generator=mask_generator,
+                            abort_on_nan=True,
+                        )
+                    elif alt_training == "on_opt":
+                        assert glocal_scaler is not None and on_opt_kappa is not None
+                        train_ok = train_trajectory_segments_on_opt(
+                            rae,
+                            optimizer,
+                            tc_full,
+                            room.wsm,
+                            device,
+                            train_params,
+                            scaler=glocal_scaler,
+                            kappa=on_opt_kappa,
+                            mask_generator=mask_generator,
+                            abort_on_nan=True,
+                        )
+                    else:
+                        train_ok = train_trajectory_segments(
+                            rae,
+                            optimizer,
+                            tc_full,
+                            room.wsm,
+                            device,
+                            train_params,
+                            mask_generator=mask_generator,
+                            abort_on_nan=True,
+                        )
+                    if not train_ok:
+                        print("Trial aborted: non-finite loss/weights during training")
+                        return aborted_trial_metrics(variant=variant)
 
-    need_ratemaps = output_dir is not None and trial_index is not None
-    if need_ratemaps:
-        metrics, ratemaps = compute_trial_metrics(
+        need_ratemaps = output_dir is not None and trial_index is not None
+        if need_ratemaps:
+            metrics, ratemaps = compute_trial_metrics(
+                rae,
+                rooms,
+                experiment,
+                mask_generator=mask_generator,
+                return_ratemaps=True,
+                variant=variant,
+                lambda_unif=lambda_unif,
+            )
+            metrics["aborted_nan"] = 0.0
+            ratemap_path = save_trial_ratemap(
+                output_dir, trial_index, ratemaps[0], params, metrics=metrics
+            )
+            metrics["ratemap_path"] = str(ratemap_path)
+            return metrics
+
+        metrics = compute_trial_metrics(
             rae,
             rooms,
             experiment,
             mask_generator=mask_generator,
-            return_ratemaps=True,
             variant=variant,
             lambda_unif=lambda_unif,
         )
         metrics["aborted_nan"] = 0.0
-        ratemap_path = save_trial_ratemap(
-            output_dir, trial_index, ratemaps[0], params, metrics=metrics
-        )
-        metrics["ratemap_path"] = str(ratemap_path)
         return metrics
+    finally:
+        _release_trial_gpu_memory(rae, device)
 
-    metrics = compute_trial_metrics(
-        rae,
-        rooms,
-        experiment,
-        mask_generator=mask_generator,
-        variant=variant,
-        lambda_unif=lambda_unif,
-    )
-    metrics["aborted_nan"] = 0.0
-    return metrics
+
+def _release_trial_gpu_memory(rae: torch.nn.Module, device: torch.device) -> None:
+    del rae
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()

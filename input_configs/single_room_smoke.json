@@ -1,0 +1,55 @@
+{
+  "experiment_type": "single_room",
+  "description": "Tiny CPU smoke config for validating training-mode plumbing. Not a scientific run.",
+  "model": {
+    "activation": "relu",
+    "alpha": 0.1275,
+    "learn_alpha": false,
+    "preact_noise": 0.0,
+    "postact_noise": 0.0
+  },
+  "single_room": {
+    "room": {
+      "room_width_cm": 60,
+      "room_height_cm": null,
+      "n_wsm_cells": 40,
+      "wsm_sigma": 8,
+      "wsm_ssigma": 0,
+      "wsm_magnitude": 4.0,
+      "wsm_seed": 3003,
+      "speed": "med",
+      "boundary_avoidance": false
+    },
+    "trajectories": {
+      "trajectory_duration_s": 60.0,
+      "n_warm_traj": 1,
+      "n_train_traj": 2,
+      "traj_seed": 13003,
+      "n_eval_traj": 2,
+      "eval_traj_duration_s": 30.0,
+      "eval_traj_seed": 23003
+    },
+    "warmup": {
+      "warmup_step_size_s": 30.0,
+      "warmup_gaussian_sigma": 15.0
+    },
+    "training": {
+      "train_step_size_s": 10.0,
+      "n_hidden": 60,
+      "lambda_mse": 90.96,
+      "lambda_fr": 116.6,
+      "mask_rate": 0.4176,
+      "mask_method": "cell",
+      "mask_rng_seed": 3003,
+      "init_seed": 3003,
+      "gradient_clip_max": 10,
+      "carry_state": false,
+      "capture_every_n_segments": 1,
+      "max_units_per_layer": null,
+      "record_n_eval_segments": null,
+      "device": "cpu"
+    },
+    "n_epochs": 1
+  },
+  "optimizers": ["adam"]
+}

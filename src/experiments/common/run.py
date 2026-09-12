@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from core.experiment import RoomExperiment
+from core.alt_training import AltTrainingVariant, alt_training_path_tag
 from experiments.common.config import ExperimentConfig, require_config_dict
 from experiments.common.paths import ExperimentPaths
 from experiments.many_rooms.config import load_many_rooms_experiment_config
@@ -76,12 +77,14 @@ def create_experiment(
     run_config: ExperimentRunConfig,
     *,
     optimizer_config: dict[str, Any] | None = None,
+    alt_training: AltTrainingVariant | None = None,
 ) -> RoomExperiment:
     """Instantiate the experiment driver for a loaded run configuration."""
     if optimizer_config is None:
         opt_type = run_config.optimizers[0]
         optimizer_config = build_optimizer_config(opt_type)
     optimizer_tag = optimizer_tag_from_config(optimizer_config)
+    alt_training_tag = alt_training_path_tag(alt_training) if alt_training else None
 
     experiment_type = run_config.experiment_type
     if experiment_type == SINGLE_ROOM_NAME:
@@ -89,18 +92,21 @@ def create_experiment(
             run_config.config,
             optimizer_config,
             optimizer_tag=optimizer_tag,
+            alt_training_tag=alt_training_tag,
         )
     if experiment_type == TWO_ROOMS_NAME:
         return TwoRoomsExperiment(
             run_config.config,
             optimizer_config,
             optimizer_tag=optimizer_tag,
+            alt_training_tag=alt_training_tag,
         )
     if experiment_type == MANY_ROOMS_NAME:
         return ManyRoomsExperiment(
             run_config.config,
             optimizer_config,
             optimizer_tag=optimizer_tag,
+            alt_training_tag=alt_training_tag,
         )
     raise ValueError(f"Unknown experiment_type: {experiment_type}")
 

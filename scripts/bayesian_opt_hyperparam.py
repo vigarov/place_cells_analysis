@@ -24,6 +24,8 @@ Usage::
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant c --n-trials 30
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --lr-only --n-trials 20
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant b --ab-only --n-trials 20
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant a --alt-training lora --rank 16 --n-trials 30
+    uv run bayesian-opt-hyperparam --config input_configs/single_room.json --variant a --alt-training on_opt --n-trials 30
     uv run bayesian-opt-hyperparam --config input_configs/single_room.json --lr-only --exclude-opt sgd --n-trials 20
 """
 import argparse
@@ -46,12 +48,15 @@ from core.hyperparam_trial import (
     BAD_RUN_LOSS,
     BAD_RUN_TRAIN_ERROR,
     MAX_FR_FACTOR,
+    AltTrainingVariant,
     BoVariant,
+    alt_training_path_tag,
     apply_trial_params,
     bo_parameter_constraints,
     estimate_trial_segments,
     fixed_trial_params,
     lambda_fr_mse_parameter_constraints,
+    normalize_alt_training_variant,
     run_hyperparam_trial,
     search_bounds_from_config,
 )
@@ -142,18 +147,49 @@ def _default_output_dir(
     *,
     optimizer: str | None = None,
     stamp: str | None = None,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
 ) -> Path:
     stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    alt_tag = alt_training_path_tag(alt_training, rank=alt_rank) if alt_training else ""
     if optimizer is not None:
-        run_name = f"variant_{variant}_{optimizer}_{stamp}"
+        run_name = f"variant_{variant}{alt_tag}_{optimizer}_{stamp}"
     else:
-        run_name = f"variant_{variant}_{stamp}"
+        run_name = f"variant_{variant}{alt_tag}_{stamp}"
     return Path("results") / "hyperparam_opt" / experiment_type / run_name
 
 
 def _trials_csv_fields(
-    variant: BoVariant, *, lr_only: bool = False, ab_only: bool = False
+    variant: BoVariant,
+    *,
+    lr_only: bool = False,
+    ab_only: bool = False,
+    alt_training: AltTrainingVariant | None = None,
 ) -> list[str]:
+    if alt_training:
+        tuned_param = "beta" if alt_training == "lora" else "kappa"
+        fields = [
+            "trial_index",
+            "timestamp",
+            tuned_param,
+            "lambda_mse",
+            "lambda_fr",
+            "gradient_clip_max",
+            "mask_rate",
+            "alpha",
+        ]
+        if variant == "b":
+            fields.append("lambda_ab")
+        if variant == "c":
+            fields.extend(["nl", "nr", "s"])
+        fields.extend(TRIAL_METRIC_FIELDS)
+        if variant == "b":
+            fields.extend(VARIANT_B_METRIC_FIELDS)
+        if variant == "c":
+            fields.extend(VARIANT_C_METRIC_FIELDS)
+        fields.append("ratemap_path")
+        return fields
+
     if lr_only:
         fields = [
             "trial_index",
@@ -299,6 +335,8 @@ def _create_ax_client(
     use_lambda_fr_constraint: bool,
     optimize_error: bool,
     optimizer: str | None = None,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
 ) -> AxClient:
     objectives, outcome_constraints, tracking_metric_names = _ax_setup(
         optimize_error=optimize_error
@@ -309,6 +347,8 @@ def _create_ax_client(
         bounds=bounds,
     )
     experiment_name = f"hyperparam_{experiment_type}_variant_{variant}"
+    if alt_training is not None:
+        experiment_name = f"{experiment_name}{alt_training_path_tag(alt_training, rank=alt_rank)}"
     if optimizer is not None:
         experiment_name = f"{experiment_name}_{optimizer}"
     ax_client = AxClient(random_seed=random_seed, verbose_logging=True)
@@ -379,6 +419,8 @@ def _write_run_meta(
     lr_only: bool = False,
     ab_only: bool = False,
     optimizer: str | None = None,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
     migrated_from: Path | None = None,
 ) -> None:
     meta: dict[str, Any] = {
@@ -395,9 +437,15 @@ def _write_run_meta(
         "optimize_error": optimize_error,
         "lr_only": lr_only,
         "ab_only": ab_only,
+        "alt_training": alt_training is not None,
+        "alt_training_variant": alt_training,
         "max_fr_factor": MAX_FR_FACTOR,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if alt_training == "lora":
+        if alt_rank is None:
+            raise ValueError("alt_rank is required when alt_training='lora'")
+        meta["rank"] = alt_rank
     if optimizer is not None:
         meta["optimizer"] = optimizer
     if migrated_from is not None:
@@ -423,9 +471,12 @@ def _append_trial_csv(
     variant: BoVariant,
     lr_only: bool = False,
     ab_only: bool = False,
+    alt_training: AltTrainingVariant | None = None,
 ) -> None:
     csv_path = output_dir / "trials.csv"
-    fieldnames = _trials_csv_fields(variant, lr_only=lr_only, ab_only=ab_only)
+    fieldnames = _trials_csv_fields(
+        variant, lr_only=lr_only, ab_only=ab_only, alt_training=alt_training
+    )
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -571,14 +622,20 @@ def _print_trial_summary(
     lr_only: bool = False,
     ab_only: bool = False,
     optimizer: str | None = None,
+    alt_training: AltTrainingVariant | None = None,
 ) -> None:
     opt_label = f", optimizer={optimizer}" if optimizer is not None else ""
+    alt_label = f", alt-training={alt_training}" if alt_training else ""
     print(
         f"\n=== Trial {trial_num}/{n_trials} (index {trial_index}) "
-        f"[variant {variant}{opt_label}] ==="
+        f"[variant {variant}{opt_label}{alt_label}] ==="
     )
     if lr_only:
         param_parts = [f"learning_rate={params['learning_rate']:.4g}"]
+    elif alt_training == "lora":
+        param_parts = [f"beta={params['beta']:.4g}"]
+    elif alt_training == "on_opt":
+        param_parts = [f"kappa={params['kappa']:.4g}"]
     elif ab_only:
         param_parts = [f"lambda_ab={params['lambda_ab']:.4g}"]
     elif variant == "c":
@@ -683,6 +740,8 @@ def _resolve_output_dir(
     optimizer: str | None,
     stamp: str,
     multi_optimizer: bool,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
 ) -> Path:
     if base_output_dir is None:
         return _default_output_dir(
@@ -690,6 +749,8 @@ def _resolve_output_dir(
             variant,
             optimizer=optimizer if multi_optimizer else None,
             stamp=stamp,
+            alt_training=alt_training,
+            alt_rank=alt_rank,
         )
     if multi_optimizer and optimizer is not None:
         return base_output_dir / optimizer
@@ -710,6 +771,8 @@ def _run_bo_session(
     ab_only: bool,
     use_lambda_fr_constraint: bool,
     optimize_error: bool,
+    alt_training: AltTrainingVariant | None = None,
+    alt_rank: int | None = None,
 ) -> None:
     session_config = _session_config(base_config, optimizer)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -739,6 +802,23 @@ def _run_bo_session(
                 f"Resume ab_only mismatch: run_meta.json has ab_only={saved_ab_only!r}, "
                 f"but current run has ab_only={ab_only!r}"
             )
+        saved_alt_training = normalize_alt_training_variant(
+            run_meta.get("alt_training_variant", run_meta.get("alt_training"))
+        )
+        if saved_alt_training != alt_training:
+            raise SystemExit(
+                f"Resume alt_training mismatch: run_meta.json has "
+                f"alt_training_variant={saved_alt_training!r}, "
+                f"but current run has alt_training={alt_training!r}"
+            )
+        saved_rank = run_meta.get("rank")
+        if alt_training == "lora" and saved_rank != alt_rank:
+            raise SystemExit(
+                f"Resume rank mismatch: run_meta.json has rank={saved_rank!r}, "
+                f"but current run has rank={alt_rank!r}"
+            )
+        if alt_training == "on_opt" and alt_rank is not None:
+            raise SystemExit("--rank is not used with --alt-training on_opt")
         saved_optimizer = run_meta.get("optimizer")
         if optimizer is not None and saved_optimizer not in (None, optimizer):
             raise SystemExit(
@@ -828,6 +908,8 @@ def _run_bo_session(
                 use_lambda_fr_constraint=use_lambda_fr_constraint,
                 optimize_error=optimize_error,
                 optimizer=optimizer,
+                alt_training=alt_training,
+                alt_rank=alt_rank,
             )
             completed = _attach_completed_trials(
                 ax_client,
@@ -845,6 +927,8 @@ def _run_bo_session(
                 lr_only=lr_only,
                 ab_only=ab_only,
                 optimizer=optimizer,
+                alt_training=alt_training,
+                alt_rank=alt_rank,
                 migrated_from=resume_path,
             )
             ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
@@ -869,6 +953,9 @@ def _run_bo_session(
             nr_bounds=args.nr_bounds,
             s_bounds=args.s_bounds,
             apply_ab_constraint=use_lambda_fr_constraint,
+            alt_training=alt_training,
+            beta_bounds=args.beta_bounds,
+            kappa_bounds=args.kappa_bounds,
         )
         _write_run_meta(
             output_dir,
@@ -880,6 +967,8 @@ def _run_bo_session(
             lr_only=lr_only,
             ab_only=ab_only,
             optimizer=optimizer,
+            alt_training=alt_training,
+            alt_rank=alt_rank,
         )
         ax_client = _create_ax_client(
             experiment_type=session_config.experiment_type,
@@ -890,6 +979,8 @@ def _run_bo_session(
             use_lambda_fr_constraint=use_lambda_fr_constraint,
             optimize_error=optimize_error,
             optimizer=optimizer,
+            alt_training=alt_training,
+            alt_rank=alt_rank,
         )
         ax_client.save_to_json_file(str(output_dir / "ax_experiment.json"))
         start_trial = 1
@@ -917,6 +1008,10 @@ def _run_bo_session(
             mode_label = "lr-only"
         elif ab_only:
             mode_label = "ab-only"
+        elif alt_training == "lora":
+            mode_label = "altTLORA-beta-only"
+        elif alt_training == "on_opt":
+            mode_label = "altTOO-kappa-only"
         elif variant == "c":
             mode_label = "bump-shape"
         else:
@@ -958,6 +1053,7 @@ def _run_bo_session(
             variant=variant,
             lr_only=lr_only,
             ab_only=ab_only,
+            alt_training=alt_training,
         )
         metrics = run_hyperparam_trial(
             trial_config,
@@ -966,8 +1062,12 @@ def _run_bo_session(
             trial_index=trial_index,
             output_dir=output_dir,
             show_progress=args.show_progress,
+            alt_training=alt_training,
+            alt_rank=alt_rank,
         )
-        if lr_only or ab_only or variant == "c":
+        if lr_only or ab_only or alt_training:
+            merged_params = {**fixed_params, **params}
+        elif variant == "c":
             merged_params = {**fixed_params, **params}
         else:
             merged_params = params
@@ -1006,7 +1106,12 @@ def _run_bo_session(
                 **metrics,
             }
             _append_trial_csv(
-                output_dir, row, variant=variant, lr_only=lr_only, ab_only=ab_only
+                output_dir,
+                row,
+                variant=variant,
+                lr_only=lr_only,
+                ab_only=ab_only,
+                alt_training=alt_training,
             )
             _print_trial_summary(
                 trial_num,
@@ -1020,6 +1125,7 @@ def _run_bo_session(
                 lr_only=lr_only,
                 ab_only=ab_only,
                 optimizer=optimizer,
+                alt_training=alt_training,
             )
             trial_num += 1
 
@@ -1164,6 +1270,39 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--alt-training",
+        choices=["lora", "on_opt"],
+        default=None,
+        metavar="VARIANT",
+        help=(
+            "Alt-training variant: 'lora' uses a low-rank BTSP adapter (W + beta * B @ A) "
+            "with per-unit g_local_mse scaling on LoRA factors (tune beta in [0, 1]; "
+            "requires --rank; paths include altTLORA_r<rank>). "
+            "'on_opt' scales all gradients after backward by clipped kappa * inverse "
+            "z-score from g_local_mse (tune kappa in [1, 3]; paths include altTOO). "
+            "Other hyperparameters are fixed from config."
+        ),
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        metavar="R",
+        help="LoRA rank for --alt-training lora (required with lora variant).",
+    )
+    parser.add_argument(
+        "--beta-bounds",
+        type=lambda s: _parse_bounds(s, "beta"),
+        default=None,
+        help="Override beta search bounds as 'low,high' (default: 0.0,1.0; lora only)",
+    )
+    parser.add_argument(
+        "--kappa-bounds",
+        type=lambda s: _parse_bounds(s, "kappa"),
+        default=None,
+        help="Override kappa search bounds as 'low,high' (default: 1.0,3.0; on_opt only)",
+    )
+    parser.add_argument(
         "--exclude-opt",
         choices=sorted(OPTIMIZER_SHORTHAND_TO_CLASS),
         default=None,
@@ -1202,12 +1341,45 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.lr_only and args.ab_only:
         raise SystemExit("--lr-only and --ab-only are mutually exclusive")
+    if args.alt_training and (args.lr_only or args.ab_only):
+        raise SystemExit("--alt-training is mutually exclusive with --lr-only and --ab-only")
+    if args.alt_training == "lora" and args.rank is None:
+        raise SystemExit("--alt-training lora requires --rank")
+    if args.rank is not None and args.alt_training != "lora":
+        raise SystemExit("--rank requires --alt-training lora")
+    if args.rank is not None and args.rank < 1:
+        raise SystemExit("--rank must be >= 1")
+    if args.beta_bounds is not None and args.alt_training != "lora":
+        raise SystemExit("--beta-bounds requires --alt-training lora")
+    if args.kappa_bounds is not None and args.alt_training != "on_opt":
+        raise SystemExit("--kappa-bounds requires --alt-training on_opt")
     if args.ab_only and variant != "b":
         raise SystemExit("--ab-only requires --variant b")
     if variant == "c" and (args.lr_only or args.ab_only):
         raise SystemExit("variant c does not support --lr-only or --ab-only")
 
-    if args.lr_only:
+    if args.alt_training:
+        bound_overrides = [
+            name
+            for name, value in (
+                ("--lambda-mse-bounds", args.lambda_mse_bounds),
+                ("--lambda-fr-bounds", args.lambda_fr_bounds),
+                ("--gradient-clip-bounds", args.gradient_clip_bounds),
+                ("--lambda-ab-bounds", args.lambda_ab_bounds),
+                ("--alpha-bounds", args.alpha_bounds),
+                ("--nl-bounds", args.nl_bounds),
+                ("--nr-bounds", args.nr_bounds),
+                ("--s-bounds", args.s_bounds),
+            )
+            if value is not None
+        ]
+        if bound_overrides:
+            print(
+                f"Note: ignoring hyperparameter bound overrides in --alt-training "
+                f"{args.alt_training} mode: "
+                + ", ".join(bound_overrides)
+            )
+    elif args.lr_only:
         bound_overrides = [
             name
             for name, value in (
@@ -1250,8 +1422,14 @@ def main(argv: list[str] | None = None) -> None:
     _verify_room_data(base_config)
     lr_only = args.lr_only
     ab_only = args.ab_only
+    alt_training: AltTrainingVariant | None = args.alt_training
+    alt_rank = args.rank if alt_training == "lora" else None
     use_lambda_fr_constraint = (
-        not args.no_constraint and not lr_only and not ab_only and variant != "c"
+        not args.no_constraint
+        and not lr_only
+        and not ab_only
+        and alt_training is None
+        and variant != "c"
     )
     optimize_error = args.error
 
@@ -1280,6 +1458,8 @@ def main(argv: list[str] | None = None) -> None:
                 optimizer=optimizer,
                 stamp=stamp,
                 multi_optimizer=multi_optimizer,
+                alt_training=alt_training,
+                alt_rank=alt_rank,
             )
             resume_path = None
         _run_bo_session(
@@ -1295,6 +1475,8 @@ def main(argv: list[str] | None = None) -> None:
             ab_only=ab_only,
             use_lambda_fr_constraint=use_lambda_fr_constraint,
             optimize_error=optimize_error,
+            alt_training=alt_training,
+            alt_rank=alt_rank,
         )
 
 

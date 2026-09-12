@@ -86,10 +86,12 @@ class RoomExperiment(abc.ABC):
         optimizer_config: dict[str, Any],
         *,
         optimizer_tag: str | None = None,
+        alt_training_tag: str | None = None,
     ) -> None:
         self.config = config
         self.optimizer_config = optimizer_config
         self.optimizer_tag = optimizer_tag
+        self.alt_training_tag = alt_training_tag
         self.dt: float = 0.05  # overwritten by `load_rooms()` from the room manifest
 
     @property
@@ -182,9 +184,16 @@ class RoomExperiment(abc.ABC):
 
     def resolve_paths(self) -> ExperimentPaths:
         """Resolve this run's results/signals/ratemaps/checkpoint directories."""
+        if self.alt_training_tag:
+            family = f"{self.name}{self.alt_training_tag}"
+            results_base = self.results_base.parent / family
+            ckpt_base = self.ckpt_base.parent / family
+        else:
+            results_base = self.results_base
+            ckpt_base = self.ckpt_base
         return resolve_experiment_paths(
-            self.results_base,
-            self.ckpt_base,
+            results_base,
+            ckpt_base,
             self.suffix,
             optimizer_tag=self.optimizer_tag,
         )

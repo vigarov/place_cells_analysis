@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
@@ -27,6 +27,9 @@ from models.custom_learnable_activation import custom_ab_reg_loss
 from models.utils import build_rae, build_tracked_units, order_node_ids, seed_model_init
 from optimizers import optimizer_extractor_from_dict
 from optimizers.base import OptimizerSignalExtractor
+
+if TYPE_CHECKING:
+    from core.plateau_training import PlateauConfig
 
 
 def fr_loss(states):
@@ -76,6 +79,9 @@ class SegmentResult:
     optimizer_signals: dict[str, dict[str, Any]] = field(default_factory=dict)
     weight_snapshots: dict[str, np.ndarray] = field(default_factory=dict)
     shampoo_blocks: dict[str, np.ndarray] = field(default_factory=dict)
+    on_opt_scale_factors: np.ndarray | None = None  # (H,) per-hidden-unit multipliers
+    plateau_units: np.ndarray | None = None  # hidden units rewritten by a plateau
+    plateau_damping: np.ndarray | None = None  # (H,) incoming-grad multipliers
 
 
 def model_has_nonfinite(rae: torch.nn.Module) -> bool:
@@ -139,6 +145,7 @@ def train_one_segment(
     init_state: torch.Tensor | None = None,
     capture_gradients: bool = False,
     extractor: OptimizerSignalExtractor | None = None,
+    on_activity: Callable[[np.ndarray, torch.Tensor], None] | None = None,
     abort_on_nan: bool = False,
 ) -> SegmentResult:
     """Run exactly one truncated-BPTT gradient update on one pre-sliced chunk.
@@ -217,6 +224,9 @@ def train_one_segment(
         optimizer_signals.update(extractor.on_after_step(rae, optimizer))
         shampoo_blocks = extractor.on_after_step_shampoo_blocks(rae, optimizer)
 
+    if on_activity is not None:
+        on_activity(tc[:, 1:], h.detach())
+
     final_state = h[:, -1, :].detach().clone() if config.carry_state else None
 
     return SegmentResult(
@@ -241,6 +251,7 @@ def train_trajectory_segments(
     capture_gradients: bool = False,
     extractor: OptimizerSignalExtractor | None = None,
     on_segment: Callable[[int, int, SegmentResult], None] | None = None,
+    on_activity: Callable[[np.ndarray, torch.Tensor], None] | None = None,
     segment_progress: tqdm | None = None,
     abort_on_nan: bool = False,
 ) -> bool:
@@ -265,6 +276,7 @@ def train_trajectory_segments(
             init_state=state if config.carry_state else None,
             capture_gradients=capture_gradients,
             extractor=extractor,
+            on_activity=on_activity,
             abort_on_nan=abort_on_nan,
         )
         if abort_on_nan and (
@@ -312,6 +324,12 @@ def _save_segment_signals(
     payload["node_ids"] = np.array(node_ids)
     payload.update(result.weight_snapshots)
     payload.update(result.shampoo_blocks)
+    if result.on_opt_scale_factors is not None:
+        payload["on_opt_scale_factors"] = result.on_opt_scale_factors.astype(np.float32)
+    if result.plateau_units is not None:
+        payload["plateau_units"] = result.plateau_units.astype(np.int32)
+    if result.plateau_damping is not None:
+        payload["plateau_damping"] = result.plateau_damping.astype(np.float32)
 
     np.savez_compressed(traj_dir / f"segment_{seg_idx}.npz", **payload)
 
@@ -372,6 +390,9 @@ def _build_run_config_payload(
     experiment_type: str | None,
     started_at: str,
     completed_at: str | None = None,
+    alt_training: Literal["on_opt", "plateau"] | None = None,
+    kappa: float | None = None,
+    plateau_config: Any | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "source_config": str(source_config_path.resolve()) if source_config_path else None,
@@ -380,6 +401,12 @@ def _build_run_config_payload(
         "experiment_config": asdict(experiment.config),
         "started_at": started_at,
     }
+    if alt_training is not None:
+        payload["alt_training"] = alt_training
+    if kappa is not None:
+        payload["kappa"] = kappa
+    if plateau_config is not None:
+        payload["plateau_config"] = asdict(plateau_config)
     if completed_at is not None:
         payload["completed_at"] = completed_at
     return payload
@@ -391,15 +418,27 @@ def run_experiment(
     show_progress_level: int | None = None,
     source_config_path: Path | None = None,
     experiment_type: str | None = None,
+    alt_training: Literal["on_opt", "plateau"] | None = None,
+    kappa: float = 2.7,
+    plateau_config: "PlateauConfig | None" = None,
 ) -> ExperimentPaths:
     """Run warmup + main training for a room-based experiment."""
     # import here to avoid circular imports
+    from core.alt_training import LocalMseUnitScaler, train_trajectory_segments_on_opt
+    from core.plateau_training import (
+        PlateauConfig,
+        PlateauState,
+        resolve_plateau_layers,
+        train_trajectory_segments_plateau,
+    )
     from core.warmup import run_warmup
 
     if show_progress_level is None:
         show_progress_level = experiment.default_show_progress_level
     if show_progress_level not in range(4):
         raise ValueError(f"show_progress_level must be 0-3, got {show_progress_level}")
+    if alt_training == "plateau" and plateau_config is None:
+        plateau_config = PlateauConfig()
 
     config = experiment.config
     device = config.resolve_device()
@@ -415,6 +454,9 @@ def run_experiment(
             source_config_path=source_config_path,
             experiment_type=experiment_type,
             started_at=started_at,
+            alt_training=alt_training,
+            kappa=kappa if alt_training == "on_opt" else None,
+            plateau_config=plateau_config,
         ),
     )
 
@@ -459,6 +501,21 @@ def run_experiment(
 
     train_step_size = round(config.training.train_step_size_s / experiment.dt)
     train_params = _train_config(experiment, train_step_size)
+    glocal_scaler = (
+        LocalMseUnitScaler(n_hidden=config.training.n_hidden)
+        if alt_training == "on_opt"
+        else None
+    )
+    plateau_state = None
+    plateau_layers = None
+    if alt_training == "plateau":
+        plateau_layers = resolve_plateau_layers(rae)
+        plateau_state = PlateauState(
+            config.training.n_hidden,
+            config=plateau_config,
+            device=device,
+            dt=experiment.dt,
+        )
 
     multi_room = len(rooms) > 1
 
@@ -547,19 +604,54 @@ def run_experiment(
                             ratemap_batches,
                         )
 
-                train_trajectory_segments(
-                    rae,
-                    optimizer,
-                    tc_full,
-                    room.wsm,
-                    device,
-                    train_params,
-                    mask_generator=mask_generator,
-                    capture_gradients=True,
-                    extractor=extractor,
-                    on_segment=_on_segment,
-                    segment_progress=segment_bar,
-                )
+                if alt_training == "plateau":
+                    assert plateau_state is not None and plateau_layers is not None
+                    train_trajectory_segments_plateau(
+                        rae,
+                        optimizer,
+                        tc_full,
+                        room.wsm,
+                        device,
+                        train_params,
+                        state=plateau_state,
+                        layers=plateau_layers,
+                        mask_generator=mask_generator,
+                        capture_gradients=True,
+                        extractor=extractor,
+                        on_segment=_on_segment,
+                        segment_progress=segment_bar,
+                    )
+                elif alt_training == "on_opt":
+                    assert glocal_scaler is not None
+                    train_trajectory_segments_on_opt(
+                        rae,
+                        optimizer,
+                        tc_full,
+                        room.wsm,
+                        device,
+                        train_params,
+                        scaler=glocal_scaler,
+                        kappa=kappa,
+                        mask_generator=mask_generator,
+                        capture_gradients=True,
+                        extractor=extractor,
+                        on_segment=_on_segment,
+                        segment_progress=segment_bar,
+                    )
+                else:
+                    train_trajectory_segments(
+                        rae,
+                        optimizer,
+                        tc_full,
+                        room.wsm,
+                        device,
+                        train_params,
+                        mask_generator=mask_generator,
+                        capture_gradients=True,
+                        extractor=extractor,
+                        on_segment=_on_segment,
+                        segment_progress=segment_bar,
+                    )
                 _flush_trajectory_ratemaps(base_tag, ratemap_batches, capture_rooms)
                 progress.end_trajectory()
             progress.end_room()
@@ -578,6 +670,9 @@ def run_experiment(
             experiment_type=experiment_type,
             started_at=started_at,
             completed_at=datetime.now(timezone.utc).isoformat(),
+            alt_training=alt_training,
+            kappa=kappa if alt_training == "on_opt" else None,
+            plateau_config=plateau_config,
         ),
     )
     if show_progress_level >= 1:
